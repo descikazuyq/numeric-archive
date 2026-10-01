@@ -16,13 +16,12 @@ const recordVersion = "numeric-job-v1"
 
 // storedJob 是作业在内存中的完整状态，所有字段均由 Store.mu 保护。
 type storedJob struct {
-	id            uint64
-	submitter     string
-	requestID     string
-	seed          int64
-	values        []int64
-	hasDependency bool
-	dependencyID  uint64
+	id           uint64
+	submitter    string
+	requestID    string
+	seed         int64
+	values       []int64
+	dependencies []uint64 // 有序直接上游作业号；空表示无依赖
 
 	queuedAt   time.Time
 	startedAt  time.Time
@@ -53,6 +52,9 @@ type jobRecord struct {
 	Values        []int64 `json:"values"`
 	HasDependency bool    `json:"has_dependency"`
 	DependencyID  uint64  `json:"dependency_id"`
+	// Dependencies 为有序直接上游作业号；旧格式记录无此字段，
+	// 恢复时由 HasDependency/DependencyID 推导。
+	Dependencies []uint64 `json:"dependencies,omitempty"`
 
 	QueuedAt   time.Time `json:"queued_at"`
 	StartedAt  time.Time `json:"started_at,omitempty"`
@@ -83,8 +85,9 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 		RequestID:     j.requestID,
 		Seed:          j.seed,
 		Values:        append([]int64(nil), j.values...),
-		HasDependency: j.hasDependency,
-		DependencyID:  j.dependencyID,
+		HasDependency: len(j.dependencies) > 0,
+		DependencyID:  depID(j),
+		Dependencies:  append([]uint64(nil), j.dependencies...),
 
 		QueuedAt:      j.queuedAt,
 		StartedAt:     j.startedAt,
@@ -97,6 +100,14 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 		Archive:         j.archive,
 	}
 	return json.MarshalIndent(&r, "", "  ")
+}
+
+// depID 返回首个直接上游作业号（无依赖时为 0）。
+func depID(j *storedJob) uint64 {
+	if len(j.dependencies) == 0 {
+		return 0
+	}
+	return j.dependencies[0]
 }
 
 // persist 在已持锁的情况下原子写一条作业记录。
@@ -196,14 +207,19 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		default:
 			return nil, 0, fmt.Errorf("numeric: 记录 %s 状态非法: %q", name, r.Status)
 		}
+		// 新格式记录直接给出有序依赖列表；旧格式记录只有单依赖字段，
+		// 恢复为只含一个作业号的列表（语义与提交时一致）。
+		deps := append([]uint64(nil), r.Dependencies...)
+		if len(deps) == 0 && r.HasDependency {
+			deps = []uint64{r.DependencyID}
+		}
 		j := &storedJob{
-			id:            r.ID,
-			submitter:     r.Submitter,
-			requestID:     r.RequestID,
-			seed:          r.Seed,
-			values:        append([]int64(nil), r.Values...),
-			hasDependency: r.HasDependency,
-			dependencyID:  r.DependencyID,
+			id:           r.ID,
+			submitter:    r.Submitter,
+			requestID:    r.RequestID,
+			seed:         r.Seed,
+			values:       append([]int64(nil), r.Values...),
+			dependencies: deps,
 
 			queuedAt:   r.QueuedAt,
 			startedAt:  r.StartedAt,
@@ -264,9 +280,25 @@ func archiveIntact(j *storedJob) bool {
 	}
 	// 归档中的原始参数必须与记录顶层字段一致。
 	if a.JobID != j.id || a.Submitter != j.submitter || a.RequestID != j.requestID ||
-		a.Seed != j.seed || a.HasDependency != j.hasDependency ||
-		(a.HasDependency && a.DependencyID != j.dependencyID) {
+		a.Seed != j.seed || a.HasDependency != (len(j.dependencies) > 0) {
 		return false
+	}
+	if a.HasDependency && a.DependencyID != depID(j) {
+		return false
+	}
+	// 依赖列表（内容与次序）必须一致。旧格式归档没有 dependencies 字段，
+	// 由单依赖字段推导后再比较。
+	aDeps := append([]uint64(nil), a.Dependencies...)
+	if len(aDeps) == 0 && a.HasDependency {
+		aDeps = []uint64{a.DependencyID}
+	}
+	if len(aDeps) != len(j.dependencies) {
+		return false
+	}
+	for i := range j.dependencies {
+		if aDeps[i] != j.dependencies[i] {
+			return false
+		}
 	}
 	if len(a.Values) != len(j.values) {
 		return false

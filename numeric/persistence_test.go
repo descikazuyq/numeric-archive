@@ -139,13 +139,13 @@ func TestReopenRecoversInterruptedRunAndBlocksDownstream(t *testing.T) {
 	})
 	writeSyntheticRecord(t, dir, &storedJob{
 		id: 2, submitter: "a", requestID: "r2",
-		values: []int64{3}, hasDependency: true, dependencyID: 1,
+		values: []int64{3}, dependencies: []uint64{1},
 		queuedAt: base.Add(2 * time.Second),
 		status:   StatusQueued,
 	})
 	writeSyntheticRecord(t, dir, &storedJob{
 		id: 3, submitter: "a", requestID: "r3",
-		values: []int64{4}, hasDependency: true, dependencyID: 2,
+		values: []int64{4}, dependencies: []uint64{2},
 		queuedAt: base.Add(3 * time.Second),
 		status:   StatusQueued,
 	})

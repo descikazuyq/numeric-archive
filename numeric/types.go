@@ -48,6 +48,9 @@ var (
 	ErrNotFound = errors.New("numeric: 作业不存在")
 	// ErrDependencyNotFound 表示提交引用了不存在的依赖作业，提交被拒绝且不产生记录。
 	ErrDependencyNotFound = errors.New("numeric: 依赖作业不存在，拒绝提交")
+	// ErrInvalidDependency 表示提交的依赖列表不合法：含有零或重复作业号，
+	// 或与单依赖方式同时填写了非空列表；该提交被拒绝且不产生记录。
+	ErrInvalidDependency = errors.New("numeric: 依赖列表不合法，拒绝提交")
 	// ErrIdempotencyConflict 表示同一提交人使用了已存在的幂等请求号，
 	// 但提交内容（整数次序、种子或依赖）与原提交不一致，保留原记录。
 	ErrIdempotencyConflict = errors.New("numeric: 幂等请求号冲突，提交内容与原提交不一致")
@@ -74,6 +77,13 @@ type SubmitRequest struct {
 	// DependencyID 是依赖作业号。依赖成功且结果归档后，其总和会作为一个
 	// 额外整数（追加在序列末尾）参与本次计算。
 	DependencyID uint64
+	// Dependencies 为有序的直接上游作业号列表（提交顺序即追加顺序）。
+	// 列表中的作业全部成功且归档完整后，本作业才可运行；各上游的总和按
+	// 列表顺序逐个追加到原始序列末尾，再计算总和与平方和——不会按上游
+	// 完成先后改变输入。列表只能引用提交时已经存在的作业，不能包含零或
+	// 重复作业号；与 HasDependency 同时填写非空列表会被拒绝。空列表
+	// 表示无依赖，单依赖方式继续可用（单依赖与只含同一作业号的列表等价）。
+	Dependencies []uint64
 }
 
 // Job 是作业元数据与结果的只读视图。
@@ -94,6 +104,13 @@ type Job struct {
 	// HasDependency / DependencyID 记录提交时指定的依赖。
 	HasDependency bool
 	DependencyID  uint64
+	// Dependencies 为提交时记录的有序直接上游作业号（保持提交顺序）；
+	// 无依赖时为空。单依赖方式提交的作业在此处表现为只含一个作业号。
+	Dependencies []uint64
+	// PendingDependencies 仅在排队时有意义：列出尚未成功归档的直接上游
+	// 作业号，保持提交时的顺序；为空表示依赖已全部就绪（或本作业无依赖），
+	// 排队原因随之变为等待计算位置。
+	PendingDependencies []uint64
 
 	// QueuedAt 为接受提交的时间，列举排序与时间范围过滤均以它为准。
 	QueuedAt time.Time
@@ -132,6 +149,9 @@ type Archive struct {
 	Values        []int64 `json:"values"`
 	HasDependency bool    `json:"has_dependency"`
 	DependencyID  uint64  `json:"dependency_id"`
+	// Dependencies 为有序直接上游作业号（保持提交顺序）；单依赖方式提交的
+	// 作业此处只含一个作业号。上游作业号不参与摘要与校验值。
+	Dependencies []uint64 `json:"dependencies,omitempty"`
 
 	// 实际参与计算的输入摘要。
 	// EffectiveValues 为实际输入序列（原始序列 + 追加的依赖总和）。
