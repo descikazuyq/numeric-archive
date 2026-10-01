@@ -1,0 +1,530 @@
+package numeric
+
+import (
+	"fmt"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Clock 用于注入时间来源，主要服务于确定性测试；生产代码使用墙钟。
+type Clock interface {
+	Now() time.Time
+}
+
+type wallClock struct{}
+
+func (wallClock) Now() time.Time { return time.Now().UTC() }
+
+// Option 配置 [Open] 的行为。
+type Option func(*Store)
+
+// WithClock 注入自定义时钟。
+func WithClock(c Clock) Option {
+	return func(s *Store) { s.now = c.Now }
+}
+
+// Store 是本地数值作业归档：负责提交、调度、取消、查询与持久化。
+//
+// 一次只运行一个作业；所有方法可被多个 goroutine 并发调用。
+type Store struct {
+	dir string
+
+	mu     sync.Mutex
+	jobs   []*storedJob // 严格按作业号（即提交先后）排列
+	byID   map[uint64]*storedJob
+	idem   map[string]uint64 // submitter\x00requestID -> 作业号
+	nextID uint64
+	closed bool
+
+	now func() time.Time
+
+	runningID uint64
+	waitCh    chan struct{}
+	stopCh    chan struct{}
+	stopping  atomic.Bool
+	wg        sync.WaitGroup
+
+	// compute 仅用于包内确定性测试：若为空则使用真实的 [computeResult]。
+	// 必须在任何 Submit 之前（Open 之后立即）设置；worker 只会在收到
+	// Submit 的唤醒之后读取它，因此与设置之间存在 happens-before 关系。
+	compute func(id uint64, inputs []int64, seed int64, canceled func() bool) (sum, sumSquares int64, reason string, ok bool)
+}
+
+// Open 打开（必要时创建）目录 dir 并恢复其中的全部作业记录。
+//
+// 恢复语义：
+//   - 已确认的提交、取消与完成结果原样保留，幂等请求号继续生效；
+//   - 上次关闭时仍在运行的作业标记为失败（计算被中断）并阻止其下游；
+//   - 排队作业继续排队并由本地唯一 worker 按提交先后处理；
+//   - 成功状态始终与完整归档同时可见。
+func Open(dir string, opts ...Option) (*Store, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	jobs, maxID, err := loadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	s := &Store{
+		dir:    dir,
+		jobs:   jobs,
+		byID:   make(map[uint64]*storedJob),
+		idem:   make(map[string]uint64),
+		nextID: maxID + 1,
+		now:    wallClock{}.Now,
+		waitCh: make(chan struct{}, 1),
+		stopCh: make(chan struct{}),
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	for _, j := range jobs {
+		s.byID[j.id] = j
+		if j.requestID != "" {
+			s.idem[s.idemKey(j.submitter, j.requestID)] = j.id
+		}
+	}
+	// 重建失败/取消作业对排队下游的阻断。
+	s.cascadeLocked()
+	s.wg.Add(1)
+	go s.worker()
+	return s, nil
+}
+
+func (s *Store) idemKey(submitter, requestID string) string {
+	return submitter + "\x00" + requestID
+}
+
+// Close 关闭归档。正在运行的作业会尽快中止并标记为失败（计算被中断），
+// 排队作业原样保留在磁盘上，下次 [Open] 继续。
+func (s *Store) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	var running *storedJob
+	if s.runningID != 0 {
+		running = s.byID[s.runningID]
+	}
+	s.mu.Unlock()
+
+	if s.stopping.CompareAndSwap(false, true) {
+		close(s.stopCh)
+	}
+	// 中止正在运行的计算。
+	if running != nil {
+		running.canceled.Store(true)
+	}
+	s.notify()
+	s.wg.Wait()
+	return nil
+}
+
+// Submit 接受一次作业提交。
+//
+// 空序列返回 [ErrEmptySequence]；引用不存在的依赖返回
+// [ErrDependencyNotFound]；同一提交人复用请求号但内容变化返回
+// [ErrIdempotencyConflict]（同时返回原作业视图）——这些拒绝都不产生记录。
+// 相同提交人+请求号+内容的重复提交（含并发重复）返回原作业及其当前状态。
+func (s *Store) Submit(req SubmitRequest) (*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.stopping.Load() {
+		return nil, ErrStoreClosed
+	}
+	if len(req.Values) == 0 {
+		return nil, ErrEmptySequence
+	}
+	if req.HasDependency {
+		if s.byID[req.DependencyID] == nil {
+			return nil, fmt.Errorf("%w：作业号 %d", ErrDependencyNotFound, req.DependencyID)
+		}
+	}
+	if req.RequestID != "" {
+		key := s.idemKey(req.Submitter, req.RequestID)
+		if origID, ok := s.idem[key]; ok {
+			orig := s.byID[origID]
+			if sameContent(orig, &req) {
+				return s.viewLocked(orig), nil
+			}
+			return s.viewLocked(orig),
+				fmt.Errorf("%w：提交人 %q 的请求号 %q 已用于作业 %d",
+					ErrIdempotencyConflict, req.Submitter, req.RequestID, origID)
+		}
+	}
+
+	now := s.now().UTC()
+	j := &storedJob{
+		id:            s.nextID,
+		submitter:     req.Submitter,
+		requestID:     req.RequestID,
+		seed:          req.Seed,
+		values:        append([]int64(nil), req.Values...),
+		hasDependency: req.HasDependency,
+		dependencyID:  req.DependencyID,
+		queuedAt:      now,
+		status:        StatusQueued,
+	}
+	// 先持久化，接受之后该提交即不可丢失。
+	if err := s.persist(j); err != nil {
+		return nil, err
+	}
+	s.nextID++
+	s.jobs = append(s.jobs, j)
+	s.byID[j.id] = j
+	if req.RequestID != "" {
+		s.idem[s.idemKey(req.Submitter, req.RequestID)] = j.id
+	}
+	// 依赖已失败/取消时，新接受的作业立刻进入失败终态。
+	s.cascadeLocked()
+	s.notifyLocked()
+	return s.viewLocked(j), nil
+}
+
+// sameContent 判断两次提交的内容是否一致；整数次序不同即视为不同内容。
+func sameContent(j *storedJob, req *SubmitRequest) bool {
+	if j.seed != req.Seed || j.hasDependency != req.HasDependency {
+		return false
+	}
+	if j.hasDependency && j.dependencyID != req.DependencyID {
+		return false
+	}
+	if len(j.values) != len(req.Values) {
+		return false
+	}
+	for i := range j.values {
+		if j.values[i] != req.Values[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Get 按作业号读取作业详情（含成功归档）；不存在返回 [ErrNotFound]。
+func (s *Store) Get(id uint64) (*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j := s.byID[id]
+	if j == nil {
+		return nil, fmt.Errorf("%w：作业号 %d", ErrNotFound, id)
+	}
+	return s.viewLocked(j), nil
+}
+
+// Cancel 请求取消作业。
+//
+// 排队或运行中的作业都可以取消；取消一旦返回成功，该作业及依赖它的作业
+// 都不会再产生成功归档。重复取消已取消的作业仍返回成功；对已成功或已
+// 失败的作业取消返回 [ErrNotCancellable]，原结果保持不变。
+func (s *Store) Cancel(id uint64) (*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, ErrStoreClosed
+	}
+	j := s.byID[id]
+	if j == nil {
+		return nil, fmt.Errorf("%w：作业号 %d", ErrNotFound, id)
+	}
+	switch j.status {
+	case StatusCanceled:
+		return s.viewLocked(j), nil
+	case StatusSucceeded, StatusFailed:
+		return s.viewLocked(j),
+			fmt.Errorf("%w：作业 %d 当前状态为 %s", ErrNotCancellable, id, j.status)
+	}
+
+	// queued / running：立刻把终态落盘，使“已确认的取消”不会因崩溃丢失。
+	now := s.now().UTC()
+	j.status = StatusCanceled
+	j.failureReason = ""
+	j.blockerID = 0
+	if j.finishedAt.IsZero() {
+		j.finishedAt = now
+	}
+	j.effectiveValues = nil
+	j.archive = nil
+	j.canceled.Store(true)
+	if err := s.persist(j); err != nil {
+		return nil, err
+	}
+	// 依赖它的等待者一并失败，且继续向更下游传播。
+	s.cascadeLocked()
+	s.notifyLocked()
+	return s.viewLocked(j), nil
+}
+
+// List 按提交人和提交时间范围（两端均包含）列出记录，结果按提交先后排列。
+// start 晚于 end 返回 [ErrInvalidTimeRange]。零值时间表示该端不限。
+func (s *Store) List(submitter string, start, end time.Time) ([]*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !start.IsZero() && !end.IsZero() && start.After(end) {
+		return nil, fmt.Errorf("%w：起始时间 %s 晚于结束时间 %s",
+			ErrInvalidTimeRange, start.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano))
+	}
+	out := make([]*Job, 0)
+	for _, j := range s.jobs { // jobs 已按 id 升序，即提交先后
+		if j.submitter != submitter {
+			continue
+		}
+		if !start.IsZero() && j.queuedAt.Before(start) {
+			continue
+		}
+		if !end.IsZero() && j.queuedAt.After(end) {
+			continue
+		}
+		out = append(out, s.viewLocked(j))
+	}
+	return out, nil
+}
+
+// cascadeLocked 把“依赖已失败/取消”的排队作业标记为失败并递归传播。
+//
+// 依赖在提交时必须已存在，因此依赖作业号必然更小，按作业号升序单趟
+// 扫描即可让阻断沿链条传播到最下游。
+func (s *Store) cascadeLocked() {
+	for _, j := range s.jobs {
+		if j.status != StatusQueued || !j.hasDependency {
+			continue
+		}
+		dep := s.byID[j.dependencyID]
+		if dep == nil {
+			continue
+		}
+		if dep.status != StatusFailed && dep.status != StatusCanceled {
+			continue
+		}
+		root := dep.blockerID
+		if root == 0 {
+			root = dep.id
+		}
+		s.markFailedLocked(j, blockedReason(dep, root), root)
+	}
+}
+
+func blockedReason(dep *storedJob, root uint64) string {
+	state := "失败"
+	if dep.status == StatusCanceled {
+		state = "被取消"
+	}
+	reason := fmt.Sprintf("依赖的作业 %d 已%s，阻断本作业继续计算", dep.id, state)
+	if dep.status == StatusFailed && dep.failureReason != "" {
+		reason += "（其失败原因：" + dep.failureReason + "）"
+	}
+	if root != dep.id {
+		reason += fmt.Sprintf("；阻断根因为作业 %d", root)
+	}
+	return reason
+}
+
+// pickRunnableLocked 返回提交顺序上第一个可运行的排队作业。
+// 等待依赖（依赖排队/运行中）的作业会被跳过，不挡住后面的作业。
+func (s *Store) pickRunnableLocked() *storedJob {
+	for _, j := range s.jobs {
+		if j.status != StatusQueued {
+			continue
+		}
+		if !j.hasDependency {
+			return j
+		}
+		if dep := s.byID[j.dependencyID]; dep != nil && dep.status == StatusSucceeded {
+			return j
+		}
+	}
+	return nil
+}
+
+// notifyLocked 在持锁状态下非阻塞唤醒 worker。
+func (s *Store) notifyLocked() {
+	select {
+	case s.waitCh <- struct{}{}:
+	default:
+	}
+}
+
+// notify 在不持锁时唤醒 worker。
+func (s *Store) notify() {
+	s.mu.Lock()
+	s.notifyLocked()
+	s.mu.Unlock()
+}
+
+// persistRetry 对落盘做有限次重试，尽量避免内存状态与磁盘记录分叉。
+func (s *Store) persistRetry(j *storedJob, attempts int) error {
+	var err error
+	for i := 0; i < attempts; i++ {
+		if err = s.persist(j); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+// worker 是本地唯一的计算执行体。
+func (s *Store) worker() {
+	defer s.wg.Done()
+	for {
+		s.mu.Lock()
+		if s.stopping.Load() {
+			s.mu.Unlock()
+			return
+		}
+		j := s.pickRunnableLocked()
+		if j == nil {
+			ch := s.waitCh
+			s.mu.Unlock()
+			select {
+			case <-ch:
+			case <-s.stopCh:
+			}
+			continue
+		}
+
+		// 进入运行并原子持久化该状态。
+		j.status = StatusRunning
+		j.startedAt = s.now().UTC()
+		inputs := append([]int64(nil), j.values...)
+		if j.hasDependency {
+			if dep := s.byID[j.dependencyID]; dep != nil && dep.archive != nil {
+				inputs = append(inputs, dep.archive.Sum)
+			}
+		}
+		seed := j.seed
+		s.runningID = j.id
+		if err := s.persistRetry(j, 3); err != nil {
+			// 连运行状态都无法落盘：保守地失败，不进行计算。
+			s.markFailedLocked(j, "无法持久化作业状态："+err.Error(), 0)
+			s.runningID = 0
+			s.cascadeLocked()
+			s.notifyLocked()
+			s.mu.Unlock()
+			continue
+		}
+		s.mu.Unlock()
+
+		abort := func() bool { return j.canceled.Load() || s.stopping.Load() }
+		doCompute := s.compute
+		if doCompute == nil {
+			doCompute = func(_ uint64, in []int64, sd int64, c func() bool) (int64, int64, string, bool) {
+				return computeResult(in, sd, c)
+			}
+		}
+		sum, sumSq, reason, ok := doCompute(j.id, inputs, seed, abort)
+
+		s.mu.Lock()
+		s.runningID = 0
+		switch {
+		case j.status == StatusCanceled:
+			// 用户取消已在 Cancel 中落盘；此处确保丢弃任何计算产物。
+			j.archive = nil
+			j.effectiveValues = nil
+			_ = s.persistRetry(j, 3)
+			s.cascadeLocked()
+		case s.stopping.Load():
+			s.markFailedLocked(j, "计算被中断：归档在计算过程中关闭", 0)
+			s.cascadeLocked()
+		case !ok:
+			s.markFailedLocked(j, reason, 0)
+			s.cascadeLocked()
+		default:
+			// 成功：状态与完整归档在同一条记录的同一次原子写入中可见。
+			completed := s.now().UTC()
+			a := newArchive(j, inputs, sum, sumSq, completed)
+			j.effectiveValues = append([]int64(nil), inputs...)
+			j.status = StatusSucceeded
+			j.finishedAt = completed
+			j.failureReason = ""
+			j.blockerID = 0
+			j.archive = a
+			if err := s.persistRetry(j, 3); err != nil {
+				// 落盘失败时绝不让对外可见“成功却没有归档”：回退为失败。
+				j.archive = nil
+				j.effectiveValues = nil
+				s.markFailedLocked(j, "结果归档写入失败："+err.Error(), 0)
+			}
+		}
+		s.notifyLocked()
+		s.mu.Unlock()
+	}
+}
+
+// markFailedLocked 在持锁状态下把作业置为失败终态并尝试落盘。
+func (s *Store) markFailedLocked(j *storedJob, reason string, blocker uint64) {
+	j.status = StatusFailed
+	j.failureReason = reason
+	j.blockerID = blocker
+	if j.finishedAt.IsZero() {
+		j.finishedAt = s.now().UTC()
+	}
+	j.archive = nil
+	j.effectiveValues = nil
+	_ = s.persistRetry(j, 3)
+}
+
+// newArchive 构造成功归档；CompletedAt 之外的全部字段都是确定性的。
+func newArchive(j *storedJob, effective []int64, sum, sumSquares int64, completedAt time.Time) *Archive {
+	inDigest := inputsDigestHex(effective, j.seed)
+	resDigest := resultDigestHex(effective, j.seed, sum, sumSquares)
+	log := buildLog(effective, j.seed, sum, sumSquares)
+	checksum := checksumHex(effective, j.seed, sum, sumSquares, log, resDigest)
+	return &Archive{
+		JobID:           j.id,
+		Submitter:       j.submitter,
+		RequestID:       j.requestID,
+		Seed:            j.seed,
+		Values:          append([]int64(nil), j.values...),
+		HasDependency:   j.hasDependency,
+		DependencyID:    j.dependencyID,
+		EffectiveValues: append([]int64(nil), effective...),
+		InputsDigest:    inDigest,
+		Sum:             sum,
+		SumOfSquares:    sumSquares,
+		ResultDigest:    resDigest,
+		Log:             log,
+		Checksum:        checksum,
+		CompletedAt:     completedAt,
+	}
+}
+
+// viewLocked 在持锁状态下生成对外只读视图，全部切片深拷贝。
+func (s *Store) viewLocked(j *storedJob) *Job {
+	v := &Job{
+		ID:              j.id,
+		Submitter:       j.submitter,
+		RequestID:       j.requestID,
+		Seed:            j.seed,
+		Values:          append([]int64(nil), j.values...),
+		HasDependency:   j.hasDependency,
+		DependencyID:    j.dependencyID,
+		QueuedAt:        j.queuedAt,
+		StartedAt:       j.startedAt,
+		FinishedAt:      j.finishedAt,
+		Status:          j.status,
+		FailureReason:   j.failureReason,
+		BlockerID:       j.blockerID,
+		EffectiveValues: append([]int64(nil), j.effectiveValues...),
+	}
+	if j.status == StatusQueued {
+		v.WaitReason = WaitSlot
+		if j.hasDependency {
+			if dep := s.byID[j.dependencyID]; dep == nil || dep.status != StatusSucceeded {
+				v.WaitReason = WaitDependency
+			}
+		}
+	}
+	if j.archive != nil {
+		a := *j.archive
+		a.Values = append([]int64(nil), j.archive.Values...)
+		a.EffectiveValues = append([]int64(nil), j.archive.EffectiveValues...)
+		v.Archive = &a
+	}
+	return v
+}
+
+// Dir 返回归档目录路径。
+func (s *Store) Dir() string { return s.dir }
