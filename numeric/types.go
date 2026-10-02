@@ -34,9 +34,9 @@ const (
 type WaitReason string
 
 const (
-	// WaitSlot 表示依赖（若有）已产出可使用的结果，作业在等待本地唯一的计算位置。
+	// WaitSlot 表示依赖（若有）已全部产出可使用的结果，作业在等待本地唯一的计算位置。
 	WaitSlot WaitReason = "waiting for computation slot"
-	// WaitDependency 表示作业在等待其依赖的作业产出结果。
+	// WaitDependency 表示作业在等待其（一个或多个）依赖作业产出结果。
 	WaitDependency WaitReason = "waiting for dependency result"
 )
 
@@ -48,6 +48,10 @@ var (
 	ErrNotFound = errors.New("numeric: 作业不存在")
 	// ErrDependencyNotFound 表示提交引用了不存在的依赖作业，提交被拒绝且不产生记录。
 	ErrDependencyNotFound = errors.New("numeric: 依赖作业不存在，拒绝提交")
+	// ErrInvalidDependencyList 表示多依赖列表非法（含零或重复作业号），
+	// 或同时使用单依赖方式与非空列表；提交被整体拒绝，不留下记录，
+	// 也不占用幂等请求号。
+	ErrInvalidDependencyList = errors.New("numeric: 依赖列表无效（含零或重复作业号，或混用两种依赖方式），拒绝提交")
 	// ErrIdempotencyConflict 表示同一提交人使用了已存在的幂等请求号，
 	// 但提交内容（整数次序、种子或依赖）与原提交不一致，保留原记录。
 	ErrIdempotencyConflict = errors.New("numeric: 幂等请求号冲突，提交内容与原提交不一致")
@@ -69,11 +73,20 @@ type SubmitRequest struct {
 	Values []int64
 	// Seed 为种子，属于提交内容的一部分，并参与结果摘要与校验值计算。
 	Seed int64
-	// HasDependency 为 true 时 DependencyID 指定本作业依赖的已存在作业。
+	// HasDependency 为 true 时 DependencyID 指定本作业依赖的单个已存在作业。
+	// 这是较早的单依赖写法，继续受支持；它与只含同一个作业号的 Dependencies
+	// 单元素列表视为完全相同的提交内容。
 	HasDependency bool
-	// DependencyID 是依赖作业号。依赖成功且结果归档后，其总和会作为一个
-	// 额外整数（追加在序列末尾）参与本次计算。
+	// DependencyID 是单依赖写法下的依赖作业号。该依赖成功且结果归档后，
+	// 其总和会作为一个额外整数（追加在序列末尾）参与本次计算。
 	DependencyID uint64
+	// Dependencies 为按顺序排列的上游作业号列表：只有列表中的作业全部成功
+	// 且归档完整后，本作业才可运行；各上游的总和严格按列表次序逐个追加到
+	// 原始序列末尾，与上游完成先后无关。列表只能引用提交时已存在的作业，
+	// 不能含零或重复作业号。空列表（或 nil）表示不使用多依赖方式；
+	// 同时启用单依赖方式（HasDependency）并填写非空列表会被拒绝。
+	// 传入的切片会被复制，调用方事后修改不影响已保存的记录。
+	Dependencies []uint64
 }
 
 // Job 是作业元数据与结果的只读视图。
@@ -91,9 +104,18 @@ type Job struct {
 	Seed int64
 	// Values 为提交时记录的原始整数序列（保持原次序）。
 	Values []int64
-	// HasDependency / DependencyID 记录提交时指定的依赖。
+	// HasDependency / DependencyID 记录提交时使用的单依赖写法；
+	// 直接依赖的完整且唯一权威表示为 Dependencies（保持提交次序）。
 	HasDependency bool
 	DependencyID  uint64
+	// Dependencies 为提交时给出的有顺序直接上游作业号列表；
+	// 使用单依赖写法时它是只含 DependencyID 的单元素列表，无依赖时为空。
+	// 此处为内部记录的拷贝，调用方修改不会影响归档。
+	Dependencies []uint64
+	// PendingDependencies 仅在 Status == StatusQueued 且 WaitReason ==
+	// WaitDependency 时有意义：列出尚未成功归档的直接上游作业号，
+	// 保持提交时的次序。全部上游可用后，排队原因转为 WaitSlot。
+	PendingDependencies []uint64
 
 	// QueuedAt 为接受提交的时间，列举排序与时间范围过滤均以它为准。
 	QueuedAt time.Time
@@ -132,9 +154,12 @@ type Archive struct {
 	Values        []int64 `json:"values"`
 	HasDependency bool    `json:"has_dependency"`
 	DependencyID  uint64  `json:"dependency_id"`
+	// Dependencies 保存提交时的有顺序直接上游列表（单依赖写法下为单元素列表）。
+	// 仅用于归档溯源，不参与任何摘要与校验值。
+	Dependencies []uint64 `json:"dependencies,omitempty"`
 
 	// 实际参与计算的输入摘要。
-	// EffectiveValues 为实际输入序列（原始序列 + 追加的依赖总和）。
+	// EffectiveValues 为实际输入序列（原始序列 + 按依赖次序逐个追加的各上游总和）。
 	// InputsDigest 为其与种子的确定性摘要，与作业号、时间无关。
 	EffectiveValues []int64 `json:"effective_values"`
 	InputsDigest    string  `json:"inputs_digest"`

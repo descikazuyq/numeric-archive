@@ -23,6 +23,10 @@ type storedJob struct {
 	values        []int64
 	hasDependency bool
 	dependencyID  uint64
+	// dependencies 是直接上游作业号的唯一权威表示，保持提交次序。
+	// 单依赖写法在进入 storedJob 前即归一化为单元素列表，因此这里可能为
+	// hasDependency=true 且长度为 1；无依赖时为空。
+	dependencies []uint64
 
 	queuedAt   time.Time
 	startedAt  time.Time
@@ -53,6 +57,9 @@ type jobRecord struct {
 	Values        []int64 `json:"values"`
 	HasDependency bool    `json:"has_dependency"`
 	DependencyID  uint64  `json:"dependency_id"`
+	// Dependencies 为多依赖列表（保持提交次序）。旧格式记录没有该字段，
+	// 加载时由 HasDependency/DependencyID 归一化得到，旧记录仍可读取。
+	Dependencies []uint64 `json:"dependencies,omitempty"`
 
 	QueuedAt   time.Time `json:"queued_at"`
 	StartedAt  time.Time `json:"started_at,omitempty"`
@@ -85,6 +92,7 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 		Values:        append([]int64(nil), j.values...),
 		HasDependency: j.hasDependency,
 		DependencyID:  j.dependencyID,
+		Dependencies:  append([]uint64(nil), j.dependencies...),
 
 		QueuedAt:      j.queuedAt,
 		StartedAt:     j.startedAt,
@@ -153,6 +161,19 @@ func syncDir(dir string) {
 	}
 }
 
+// normalizeDeps 把落盘记录里的两种依赖表示归一化为唯一的有序列表。
+// 旧格式记录没有 dependencies 字段：有单依赖时还原为单元素列表，
+// 无依赖时为空，保证旧记录读取后行为与新版本一致。
+func normalizeDeps(hasDep bool, depID uint64, deps []uint64) []uint64 {
+	if len(deps) > 0 {
+		return append([]uint64(nil), deps...)
+	}
+	if hasDep {
+		return []uint64{depID}
+	}
+	return nil
+}
+
 // loadDir 扫描目录中的全部作业记录并重建内存索引。
 //
 // 恢复规则：
@@ -204,6 +225,7 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			values:        append([]int64(nil), r.Values...),
 			hasDependency: r.HasDependency,
 			dependencyID:  r.DependencyID,
+			dependencies:  normalizeDeps(r.HasDependency, r.DependencyID, r.Dependencies),
 
 			queuedAt:   r.QueuedAt,
 			startedAt:  r.StartedAt,
@@ -274,6 +296,18 @@ func archiveIntact(j *storedJob) bool {
 	for i := range j.values {
 		if a.Values[i] != j.values[i] {
 			return false
+		}
+	}
+	// 新归档显式保存了依赖顺序时必须与记录一致；旧归档没有该字段，
+	// 依赖关系已由上面的 HasDependency/DependencyID 校验，保持可读。
+	if len(a.Dependencies) > 0 {
+		if len(a.Dependencies) != len(j.dependencies) {
+			return false
+		}
+		for i := range j.dependencies {
+			if a.Dependencies[i] != j.dependencies[i] {
+				return false
+			}
 		}
 	}
 	if len(j.effectiveValues) == 0 || len(a.EffectiveValues) != len(j.effectiveValues) {

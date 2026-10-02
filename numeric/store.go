@@ -126,10 +126,14 @@ func (s *Store) Close() error {
 
 // Submit 接受一次作业提交。
 //
-// 空序列返回 [ErrEmptySequence]；引用不存在的依赖返回
-// [ErrDependencyNotFound]；同一提交人复用请求号但内容变化返回
-// [ErrIdempotencyConflict]（同时返回原作业视图）——这些拒绝都不产生记录。
-// 相同提交人+请求号+内容的重复提交（含并发重复）返回原作业及其当前状态。
+// 空序列返回 [ErrEmptySequence]；依赖列表含零或重复作业号、或同时使用单依赖
+// 方式与非空列表返回 [ErrInvalidDependencyList]；引用不存在的依赖返回
+// [ErrDependencyNotFound]；同一提交人复用请求号但内容变化（整数次序、种子或
+// 依赖列表的内容/次序）返回 [ErrIdempotencyConflict]（同时返回原作业视图）
+// ——这些拒绝都不产生记录，也不占用幂等请求号。
+// 引用已失败或已取消的上游仍会被接受，但新作业立即失败。
+// 相同提交人+请求号+内容的重复提交（含并发重复）返回原作业及其当前状态；
+// 单依赖方式与只含同一个作业号的列表视为相同内容。
 func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -139,7 +143,44 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	if len(req.Values) == 0 {
 		return nil, ErrEmptySequence
 	}
-	if req.HasDependency {
+	// 两种依赖方式不能混用；多依赖列表本身必须非零且无重复。
+	if req.HasDependency && len(req.Dependencies) > 0 {
+		return nil, fmt.Errorf("%w：同时填写了单依赖 %d 与非空依赖列表 %v",
+			ErrInvalidDependencyList, req.DependencyID, req.Dependencies)
+	}
+	deps := dependencyList(&req)
+	if len(req.Dependencies) > 0 {
+		var zeros, dups []uint64
+		seen := make(map[uint64]struct{}, len(req.Dependencies))
+		for _, id := range req.Dependencies {
+			if id == 0 {
+				if !containsUint64(zeros, 0) {
+					zeros = append(zeros, 0)
+				}
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				if !containsUint64(dups, id) {
+					dups = append(dups, id)
+				}
+				continue
+			}
+			seen[id] = struct{}{}
+		}
+		if len(zeros) > 0 || len(dups) > 0 {
+			return nil, fmt.Errorf("%w：无效作业号 %v，重复作业号 %v",
+				ErrInvalidDependencyList, zeros, dups)
+		}
+		var missing []uint64
+		for _, id := range deps { // deps 保持提交次序
+			if s.byID[id] == nil {
+				missing = append(missing, id)
+			}
+		}
+		if len(missing) > 0 {
+			return nil, fmt.Errorf("%w：依赖作业号 %v 不存在", ErrDependencyNotFound, missing)
+		}
+	} else if req.HasDependency {
 		if s.byID[req.DependencyID] == nil {
 			return nil, fmt.Errorf("%w：作业号 %d", ErrDependencyNotFound, req.DependencyID)
 		}
@@ -166,6 +207,7 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 		values:        append([]int64(nil), req.Values...),
 		hasDependency: req.HasDependency,
 		dependencyID:  req.DependencyID,
+		dependencies:  deps,
 		queuedAt:      now,
 		status:        StatusQueued,
 	}
@@ -185,12 +227,31 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	return s.viewLocked(j), nil
 }
 
-// sameContent 判断两次提交的内容是否一致；整数次序不同即视为不同内容。
-func sameContent(j *storedJob, req *SubmitRequest) bool {
-	if j.seed != req.Seed || j.hasDependency != req.HasDependency {
-		return false
+// dependencyList 返回提交的归一化直接上游列表（拷贝，保持提交次序）：
+// 优先使用多依赖列表；只启用单依赖方式时为单元素列表；否则为空。
+func dependencyList(req *SubmitRequest) []uint64 {
+	if len(req.Dependencies) > 0 {
+		return append([]uint64(nil), req.Dependencies...)
 	}
-	if j.hasDependency && j.dependencyID != req.DependencyID {
+	if req.HasDependency {
+		return []uint64{req.DependencyID}
+	}
+	return nil
+}
+
+func containsUint64(xs []uint64, x uint64) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+// sameContent 判断两次提交的内容是否一致；整数次序或直接上游列表的
+// 内容/次序不同都视为不同内容。单依赖方式与只含同一作业号的列表等价。
+func sameContent(j *storedJob, req *SubmitRequest) bool {
+	if j.seed != req.Seed {
 		return false
 	}
 	if len(j.values) != len(req.Values) {
@@ -198,6 +259,15 @@ func sameContent(j *storedJob, req *SubmitRequest) bool {
 	}
 	for i := range j.values {
 		if j.values[i] != req.Values[i] {
+			return false
+		}
+	}
+	deps := dependencyList(req)
+	if len(j.dependencies) != len(deps) {
+		return false
+	}
+	for i := range j.dependencies {
+		if j.dependencies[i] != deps[i] {
 			return false
 		}
 	}
@@ -283,36 +353,48 @@ func (s *Store) List(submitter string, start, end time.Time) ([]*Job, error) {
 	return out, nil
 }
 
-// cascadeLocked 把“依赖已失败/取消”的排队作业标记为失败并递归传播。
+// cascadeLocked 把“任一直接上游已失败/取消”的排队作业立即标记为失败并递归
+// 传播，不必等待其余上游结束。
 //
-// 依赖在提交时必须已存在，因此依赖作业号必然更小，按作业号升序单趟
-// 扫描即可让阻断沿链条传播到最下游。
+// 选择阻断者时严格按提交时的依赖列表次序，取第一个已失败/取消的直接上游；
+// 失败一旦确定即为终态，后来其余上游的状态变化不会改写原因。
+// 依赖在提交时必须已存在，因此直接上游作业号必然更小，按作业号升序单趟
+// 扫描即可让阻断沿链条传播到最下游；阻断链条上的根因作业号沿 blockerID 追溯。
 func (s *Store) cascadeLocked() {
 	for _, j := range s.jobs {
-		if j.status != StatusQueued || !j.hasDependency {
+		if j.status != StatusQueued || len(j.dependencies) == 0 {
 			continue
 		}
-		dep := s.byID[j.dependencyID]
-		if dep == nil {
-			continue
+		for idx, depID := range j.dependencies {
+			dep := s.byID[depID]
+			if dep == nil {
+				continue
+			}
+			if dep.status != StatusFailed && dep.status != StatusCanceled {
+				continue
+			}
+			root := dep.blockerID
+			if root == 0 {
+				root = dep.id
+			}
+			s.markFailedLocked(j, blockedReason(dep, root, idx, len(j.dependencies)), root)
+			break // 本作业的失败原因已确定，忽略其余上游。
 		}
-		if dep.status != StatusFailed && dep.status != StatusCanceled {
-			continue
-		}
-		root := dep.blockerID
-		if root == 0 {
-			root = dep.id
-		}
-		s.markFailedLocked(j, blockedReason(dep, root), root)
 	}
 }
 
-func blockedReason(dep *storedJob, root uint64) string {
+func blockedReason(dep *storedJob, root uint64, idx, total int) string {
 	state := "失败"
 	if dep.status == StatusCanceled {
 		state = "被取消"
 	}
-	reason := fmt.Sprintf("依赖的作业 %d 已%s，阻断本作业继续计算", dep.id, state)
+	var reason string
+	if total > 1 {
+		reason = fmt.Sprintf("多个直接上游中，作业 %d（依赖列表第 %d/%d 项）已%s，阻断本作业继续计算",
+			dep.id, idx+1, total, state)
+	} else {
+		reason = fmt.Sprintf("依赖的作业 %d 已%s，阻断本作业继续计算", dep.id, state)
+	}
 	if dep.status == StatusFailed && dep.failureReason != "" {
 		reason += "（其失败原因：" + dep.failureReason + "）"
 	}
@@ -322,17 +404,38 @@ func blockedReason(dep *storedJob, root uint64) string {
 	return reason
 }
 
+// pendingDependenciesLocked 按依赖列表次序返回尚未成功归档的直接上游作业号。
+func (s *Store) pendingDependenciesLocked(j *storedJob) []uint64 {
+	var pending []uint64
+	for _, depID := range j.dependencies {
+		dep := s.byID[depID]
+		if dep == nil || dep.status != StatusSucceeded {
+			pending = append(pending, depID)
+		}
+	}
+	return pending
+}
+
 // pickRunnableLocked 返回提交顺序上第一个可运行的排队作业。
-// 等待依赖（依赖排队/运行中）的作业会被跳过，不挡住后面的作业。
+// 等待任一上游（上游排队/运行中）的作业会被跳过，不挡住后面的作业；
+// 可运行要求全部直接上游都已成功且归档完整。
 func (s *Store) pickRunnableLocked() *storedJob {
 	for _, j := range s.jobs {
 		if j.status != StatusQueued {
 			continue
 		}
-		if !j.hasDependency {
+		if len(j.dependencies) == 0 {
 			return j
 		}
-		if dep := s.byID[j.dependencyID]; dep != nil && dep.status == StatusSucceeded {
+		ready := true
+		for _, depID := range j.dependencies {
+			dep := s.byID[depID]
+			if dep == nil || dep.status != StatusSucceeded {
+				ready = false
+				break
+			}
+		}
+		if ready {
 			return j
 		}
 	}
@@ -388,9 +491,11 @@ func (s *Store) worker() {
 		// 进入运行并原子持久化该状态。
 		j.status = StatusRunning
 		j.startedAt = s.now().UTC()
+		// 可运行意味着全部直接上游均已成功归档；严格按依赖列表次序把
+		// 各上游总和逐个追加到原始序列末尾，与上游完成先后无关。
 		inputs := append([]int64(nil), j.values...)
-		if j.hasDependency {
-			if dep := s.byID[j.dependencyID]; dep != nil && dep.archive != nil {
+		for _, depID := range j.dependencies {
+			if dep := s.byID[depID]; dep != nil && dep.archive != nil {
 				inputs = append(inputs, dep.archive.Sum)
 			}
 		}
@@ -480,6 +585,7 @@ func newArchive(j *storedJob, effective []int64, sum, sumSquares int64, complete
 		Values:          append([]int64(nil), j.values...),
 		HasDependency:   j.hasDependency,
 		DependencyID:    j.dependencyID,
+		Dependencies:    append([]uint64(nil), j.dependencies...),
 		EffectiveValues: append([]int64(nil), effective...),
 		InputsDigest:    inDigest,
 		Sum:             sum,
@@ -501,6 +607,7 @@ func (s *Store) viewLocked(j *storedJob) *Job {
 		Values:          append([]int64(nil), j.values...),
 		HasDependency:   j.hasDependency,
 		DependencyID:    j.dependencyID,
+		Dependencies:    append([]uint64(nil), j.dependencies...),
 		QueuedAt:        j.queuedAt,
 		StartedAt:       j.startedAt,
 		FinishedAt:      j.finishedAt,
@@ -511,16 +618,16 @@ func (s *Store) viewLocked(j *storedJob) *Job {
 	}
 	if j.status == StatusQueued {
 		v.WaitReason = WaitSlot
-		if j.hasDependency {
-			if dep := s.byID[j.dependencyID]; dep == nil || dep.status != StatusSucceeded {
-				v.WaitReason = WaitDependency
-			}
+		if pending := s.pendingDependenciesLocked(j); len(pending) > 0 {
+			v.WaitReason = WaitDependency
+			v.PendingDependencies = pending // 已是新分配的有序拷贝
 		}
 	}
 	if j.archive != nil {
 		a := *j.archive
 		a.Values = append([]int64(nil), j.archive.Values...)
 		a.EffectiveValues = append([]int64(nil), j.archive.EffectiveValues...)
+		a.Dependencies = append([]uint64(nil), j.archive.Dependencies...)
 		v.Archive = &a
 	}
 	return v
