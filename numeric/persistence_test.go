@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -273,6 +274,301 @@ func TestReopenFailsClosedOnCorruptedSuccessArchive(t *testing.T) {
 	g, _ := s2.Get(j.ID)
 	if g.Status != StatusFailed || g.Archive != nil {
 		t.Fatalf("corrupted archive must fail closed, got %s archive=%v", g.Status, g.Archive)
+	}
+}
+
+// fixedClock 返回固定时间，可在两次提交之间手动回拨，用于复现本机时钟回拨。
+type fixedClock struct{ t time.Time }
+
+func (c *fixedClock) Now() time.Time { return c.t }
+func (c *fixedClock) set(t time.Time) {
+	c.t = t
+}
+
+func atClock(h, m int) time.Time {
+	return time.Date(2026, 5, 1, h, m, 0, 0, time.UTC)
+}
+
+// gateComputeOption 与 gateCompute 等价，但以 [Option] 形式在 [Open] 启动
+// worker 之前装好计算钩子，避免重开后第一批排队作业在钩子装好前就跑完。
+func gateComputeOption() (
+	Option,
+	chan uint64,
+	func(ids ...uint64),
+	func(id uint64),
+	*[]uint64,
+	*sync.Mutex,
+) {
+	started := make(chan uint64, 64)
+	var bmu sync.Mutex
+	gates := make(map[uint64]chan struct{})
+	var ord []uint64
+	omu := &sync.Mutex{}
+	block := func(ids ...uint64) {
+		bmu.Lock()
+		defer bmu.Unlock()
+		for _, id := range ids {
+			gates[id] = make(chan struct{})
+		}
+	}
+	release := func(id uint64) {
+		bmu.Lock()
+		ch, ok := gates[id]
+		bmu.Unlock()
+		if ok {
+			close(ch)
+		}
+	}
+	opt := func(s *Store) {
+		s.compute = func(id uint64, inputs []int64, seed int64, canceled func() bool) (int64, int64, string, bool) {
+			started <- id
+			bmu.Lock()
+			ch := gates[id]
+			bmu.Unlock()
+			if ch != nil {
+				select {
+				case <-ch:
+				case <-s.stopCh: // Close 时自动放行，随后计算观察到取消而中止
+				}
+			}
+			omu.Lock()
+			ord = append(ord, id)
+			omu.Unlock()
+			return computeResult(inputs, seed, canceled)
+		}
+	}
+	return opt, started, block, release, &ord, omu
+}
+
+func snapshotOrder(ord *[]uint64, omu *sync.Mutex) []uint64 {
+	omu.Lock()
+	defer omu.Unlock()
+	return append([]uint64(nil), (*ord)...)
+}
+
+// 关闭重开后必须继续按“接受提交的先后”（作业号）排队，记录上的提交时间
+// 早晚不能改变这个次序：时钟回拨让后提交的作业留下了更早的时间也不能插队；
+// 提交时间完全相同的作业同样保持原接受顺序。
+func TestReopenKeepsAcceptanceOrderAcrossClockRollback(t *testing.T) {
+	dir := t.TempDir()
+	clock := &fixedClock{t: atClock(8, 0)}
+	s, err := Open(dir, WithClock(clock))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, block, _, _, _ := gateCompute(t, s)
+	block(1)
+	head := mustSubmit(t, s, SubmitRequest{Submitter: "a", RequestID: "head", Values: []int64{1}})
+	waitStarted(t, started, head.ID)
+
+	// 甲先接受（10:05）；时钟回拨后乙才接受（10:00），记录时间反而更早。
+	clock.set(atClock(10, 5))
+	jia := mustSubmit(t, s, SubmitRequest{Submitter: "a", RequestID: "jia", Values: []int64{2}})
+	clock.set(atClock(10, 0))
+	yi := mustSubmit(t, s, SubmitRequest{Submitter: "a", RequestID: "yi", Values: []int64{3}})
+	// 丙、丁提交时间完全相同，须保持接受顺序。
+	clock.set(atClock(10, 3))
+	bing := mustSubmit(t, s, SubmitRequest{Submitter: "a", RequestID: "bing", Values: []int64{4}})
+	ding := mustSubmit(t, s, SubmitRequest{Submitter: "a", RequestID: "ding", Values: []int64{5}})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	opt, _, _, _, ord, omu := gateComputeOption()
+	s2, err := Open(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	waitStatus(t, s2, head.ID, StatusFailed) // 上次运行被中断
+	wantOrder := []uint64{jia.ID, yi.ID, bing.ID, ding.ID}
+	for _, id := range wantOrder {
+		waitStatus(t, s2, id, StatusSucceeded)
+	}
+	gotOrder := snapshotOrder(ord, omu)
+	if len(gotOrder) != len(wantOrder) {
+		t.Fatalf("compute order=%v, want %v", gotOrder, wantOrder)
+	}
+	for i := range wantOrder {
+		if gotOrder[i] != wantOrder[i] {
+			t.Fatalf("compute order=%v, want %v（乙不得凭更早时间插队）", gotOrder, wantOrder)
+		}
+	}
+
+	// 列举同样按接受先后，而非按记录时间递增。
+	all, err := s2.List("a", atClock(10, 0), atClock(10, 5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotIDs := idList(all)
+	if len(gotIDs) != len(wantOrder) {
+		t.Fatalf("list ids=%v, want %v", gotIDs, wantOrder)
+	}
+	for i := range wantOrder {
+		if gotIDs[i] != wantOrder[i] {
+			t.Fatalf("list order=%v, want %v", gotIDs, wantOrder)
+		}
+	}
+
+	// 时间范围筛选仍以各记录保存的提交时间为准：只含 10:00 时只查到乙。
+	onlyYi, err := s2.List("a", atClock(10, 0), atClock(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onlyYi) != 1 || onlyYi[0].ID != yi.ID {
+		t.Fatalf("10:00 range=%v, want only 乙(%d)", idList(onlyYi), yi.ID)
+	}
+	// 同时包含两个时间时先列甲再列乙。
+	two, err := s2.List("a", atClock(10, 0), atClock(10, 5))
+	if err != nil || two[0].ID != jia.ID || two[1].ID != yi.ID {
+		t.Fatalf("[10:00,10:05]=%v err=%v, want 甲先于乙", idList(two), err)
+	}
+	// 同一时刻 10:03 的丙、丁仍按接受顺序列出。
+	tie, err := s2.List("a", atClock(10, 3), atClock(10, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tie) != 2 || tie[0].ID != bing.ID || tie[1].ID != ding.ID {
+		t.Fatalf("10:03 range=%v, want 丙(%d),丁(%d)", idList(tie), bing.ID, ding.ID)
+	}
+
+	// 记录时间不被改写，作业号不被重新分配。
+	gYi, _ := s2.Get(yi.ID)
+	if !gYi.QueuedAt.Equal(atClock(10, 0)) {
+		t.Fatalf("yi queuedAt=%s, 提交时间不得被改写", gYi.QueuedAt)
+	}
+	next := mustSubmit(t, s2, SubmitRequest{Submitter: "a", Values: []int64{9}})
+	if next.ID <= ding.ID {
+		t.Fatalf("new job id %d must be greater than %d", next.ID, ding.ID)
+	}
+	waitStatus(t, s2, next.ID, StatusSucceeded)
+}
+
+func idList(js []*Job) []uint64 {
+	ids := make([]uint64, len(js))
+	for i, j := range js {
+		ids[i] = j.ID
+	}
+	return ids
+}
+
+// 恢复后等待依赖的作业仍被跳过：选取可运行作业时只考虑当下依赖已全部成功的
+// 排队作业，等待者不会阻塞后面已经可运行的作业。
+func TestReopenSkipsWaitingJobWithoutBlockingLaterRunnable(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, block, _, _, _ := gateCompute(t, s)
+	block(1)
+	head := mustSubmit(t, s, SubmitRequest{Submitter: "a", RequestID: "head", Values: []int64{1}})
+	waitStarted(t, started, head.ID)
+	// up 无依赖；waiter 等待 up；ready 无依赖、提交更晚。
+	up := mustSubmit(t, s, SubmitRequest{Submitter: "a", RequestID: "up", Values: []int64{7}})
+	waiter := mustSubmit(t, s, SubmitRequest{
+		Submitter: "a", RequestID: "waiter", Values: []int64{2},
+		Dependencies: []uint64{up.ID},
+	})
+	ready := mustSubmit(t, s, SubmitRequest{Submitter: "a", RequestID: "ready", Values: []int64{3}})
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open 启动 worker 前堵住 up：head 中断失败后 up 进入计算并停住，
+	// waiter 仍等待依赖，此时可被选取的第一个排队作业必须是 ready，而非 waiter。
+	opt, started2, block2, release2, _, _ := gateComputeOption()
+	block2(up.ID)
+	s2, err := Open(dir, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	waitStatus(t, s2, head.ID, StatusFailed)
+	waitStarted(t, started2, up.ID)
+	w, _ := s2.Get(waiter.ID)
+	if w.Status != StatusQueued || w.WaitReason != WaitDependency ||
+		len(w.PendingDependencies) != 1 || w.PendingDependencies[0] != up.ID {
+		t.Fatalf("waiter after reopen: status=%s reason=%q pending=%v",
+			w.Status, w.WaitReason, w.PendingDependencies)
+	}
+	// 直接验证调度选取：跳过等待中的 waiter，返回后面已可运行的 ready。
+	s2.mu.Lock()
+	pick := s2.pickRunnableLocked()
+	s2.mu.Unlock()
+	if pick == nil || pick.id != ready.ID {
+		got := uint64(0)
+		if pick != nil {
+			got = pick.id
+		}
+		t.Fatalf("pickRunnable=%d, want ready %d（等待依赖的 waiter 必须被跳过）", got, ready.ID)
+	}
+
+	release2(up.ID)
+	waitStatus(t, s2, up.ID, StatusSucceeded)
+	// up 一旦成功，waiter 的依赖即就绪；它作业号更小，先于 ready 运行。
+	waitStatus(t, s2, waiter.ID, StatusSucceeded)
+	waitStatus(t, s2, ready.ID, StatusSucceeded)
+}
+
+// 上游因上次计算中断而失败时，即便下游记录的提交时间早于上游，等待它的作业
+// 及更下游（含多依赖）也必须在本次打开完成时级联为失败：详情说明直接阻断者，
+// 并保留沿链条传递的根因作业号。
+func TestReopenCascadesInterruptedFailureRegardlessOfTimestamps(t *testing.T) {
+	dir := t.TempDir()
+	base := atClock(10, 5)
+	// id 1 运行中（中断），记录时间 10:05；下游 id 2/3/4 的时间依次更早。
+	writeSyntheticRecord(t, dir, &storedJob{
+		id: 1, submitter: "a", requestID: "r1",
+		values:    []int64{1},
+		queuedAt:  base,
+		startedAt: base.Add(time.Second),
+		status:    StatusRunning,
+	})
+	writeSyntheticRecord(t, dir, &storedJob{
+		id: 2, submitter: "a", requestID: "r2",
+		values: []int64{2}, dependencies: []uint64{1},
+		queuedAt: atClock(10, 0), // 早于上游
+		status:   StatusQueued,
+	})
+	writeSyntheticRecord(t, dir, &storedJob{
+		id: 3, submitter: "a", requestID: "r3",
+		values: []int64{3}, dependencies: []uint64{2},
+		queuedAt: atClock(9, 55), // 更早
+		status:   StatusQueued,
+	})
+	writeSyntheticRecord(t, dir, &storedJob{
+		id: 4, submitter: "a", requestID: "r4",
+		values: []int64{4}, dependencies: []uint64{2, 3},
+		queuedAt: atClock(9, 50),
+		status:   StatusQueued,
+	})
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	j1, _ := s.Get(1)
+	if j1.Status != StatusFailed || !strings.Contains(j1.FailureReason, "中断") {
+		t.Fatalf("interrupted: status=%s reason=%q", j1.Status, j1.FailureReason)
+	}
+	j2 := waitStatus(t, s, 2, StatusFailed)
+	j3 := waitStatus(t, s, 3, StatusFailed)
+	j4 := waitStatus(t, s, 4, StatusFailed)
+	if j2.BlockerID != 1 || j3.BlockerID != 1 || j4.BlockerID != 1 {
+		t.Fatalf("blockers %d,%d,%d want root 1", j2.BlockerID, j3.BlockerID, j4.BlockerID)
+	}
+	// 直接阻断者按依赖列表顺序指出；根因作业号沿链条传递。
+	if !strings.Contains(j2.FailureReason, "直接上游作业 1") {
+		t.Fatalf("j2 reason=%q must name direct blocker 1", j2.FailureReason)
+	}
+	if !strings.Contains(j4.FailureReason, "直接上游作业 2") ||
+		!strings.Contains(j4.FailureReason, "阻断根因为作业 1") {
+		t.Fatalf("j4 reason=%q must name direct blocker 2 and root 1", j4.FailureReason)
 	}
 }
 

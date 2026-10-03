@@ -263,10 +263,11 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			maxID = j.id
 		}
 	}
+	// 严格按作业号（即接受提交的先后）排列，不按记录上的提交时间排序：
+	// 本机时钟可能回拨，后接受的作业可能留下更早的 queuedAt，按时间排序会
+	// 让它插队并打乱依赖链。作业号在接受时单调分配且永不重新分配，因此它才是
+	// 关闭前后含义一致的“提交先后”；提交时间相同的作业也据此保持原次序。
 	sort.Slice(jobs, func(a, b int) bool {
-		if !jobs[a].queuedAt.Equal(jobs[b].queuedAt) {
-			return jobs[a].queuedAt.Before(jobs[b].queuedAt)
-		}
 		return jobs[a].id < jobs[b].id
 	})
 	return jobs, maxID, nil
