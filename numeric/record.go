@@ -263,10 +263,12 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			maxID = j.id
 		}
 	}
+	// 恢复后的排列必须与关闭前的接受先后一致：作业号在接受时单调分配，
+	// 按作业号升序即提交先后。记录上的提交时间只用于时间范围过滤，
+	// 不参与排序——本机时钟回拨会让后接受的作业带有更早的时间，
+	// 按时间重排会改变已确定的先后关系（也会让上游作业号更大的
+	// 依赖链在单趟级联扫描中漏掉失败传播）。
 	sort.Slice(jobs, func(a, b int) bool {
-		if !jobs[a].queuedAt.Equal(jobs[b].queuedAt) {
-			return jobs[a].queuedAt.Before(jobs[b].queuedAt)
-		}
 		return jobs[a].id < jobs[b].id
 	})
 	return jobs, maxID, nil

@@ -112,7 +112,8 @@ type Job struct {
 	// 排队原因随之变为等待计算位置。
 	PendingDependencies []uint64
 
-	// QueuedAt 为接受提交的时间，列举排序与时间范围过滤均以它为准。
+	// QueuedAt 为接受提交时记录的时间，仅用于时间范围过滤；列举结果的
+	// 排列以接受先后（作业号）为准，时钟回拨导致的记录时间早晚不影响次序。
 	QueuedAt time.Time
 	// StartedAt 为进入运行状态的时间；未运行过为零值。
 	StartedAt time.Time
