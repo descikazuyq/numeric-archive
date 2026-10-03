@@ -28,13 +28,22 @@ func WithClock(c Clock) Option {
 // Store 是本地数值作业归档：负责提交、调度、取消、查询与持久化。
 //
 // 一次只运行一个作业；所有方法可被多个 goroutine 并发调用。
+// idemIdentity 是幂等作用域（提交人, 请求号）的复合键。两个字段都按调用方
+// 给出的完整字符串逐字节参与比较，允许包含 U+0000。不能用分隔符把两个字段
+// 拼成单个字符串：提交人 "a"、请求号 "b\x00c" 与提交人 "a\x00b"、请求号 "c"
+// 在任何分隔符方案下都会产生歧义（分隔符本身可以出现在字段内部）。
+type idemIdentity struct {
+	submitter string
+	requestID string
+}
+
 type Store struct {
 	dir string
 
 	mu     sync.Mutex
 	jobs   []*storedJob // 严格按作业号（即提交先后）排列
 	byID   map[uint64]*storedJob
-	idem   map[string]uint64 // submitter\x00requestID -> 作业号
+	idem   map[idemIdentity]uint64 // (提交人, 请求号) -> 作业号
 	nextID uint64
 	closed bool
 
@@ -77,7 +86,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		dir:    dir,
 		jobs:   jobs,
 		byID:   make(map[uint64]*storedJob),
-		idem:   make(map[string]uint64),
+		idem:   make(map[idemIdentity]uint64),
 		nextID: maxID + 1,
 		now:    wallClock{}.Now,
 		waitCh: make(chan struct{}, 1),
@@ -89,7 +98,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	for _, j := range jobs {
 		s.byID[j.id] = j
 		if j.requestID != "" {
-			s.idem[s.idemKey(j.submitter, j.requestID)] = j.id
+			s.idem[idemIdentity{j.submitter, j.requestID}] = j.id
 		}
 	}
 	// 重建失败/取消作业对排队下游的阻断。
@@ -97,10 +106,6 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	s.wg.Add(1)
 	go s.worker()
 	return s, nil
-}
-
-func (s *Store) idemKey(submitter, requestID string) string {
-	return submitter + "\x00" + requestID
 }
 
 // Close 关闭归档。正在运行的作业会尽快中止并标记为失败（计算被中断），
@@ -150,7 +155,7 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	}
 	deps := requestDeps(&req)
 	if req.RequestID != "" {
-		key := s.idemKey(req.Submitter, req.RequestID)
+		key := idemIdentity{req.Submitter, req.RequestID}
 		if origID, ok := s.idem[key]; ok {
 			orig := s.byID[origID]
 			if sameContent(orig, &req) {
@@ -181,7 +186,7 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	s.jobs = append(s.jobs, j)
 	s.byID[j.id] = j
 	if req.RequestID != "" {
-		s.idem[s.idemKey(req.Submitter, req.RequestID)] = j.id
+		s.idem[idemIdentity{req.Submitter, req.RequestID}] = j.id
 	}
 	// 依赖已失败/取消时，新接受的作业立刻进入失败终态。
 	s.cascadeLocked()
