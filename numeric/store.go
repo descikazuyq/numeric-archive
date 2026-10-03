@@ -34,7 +34,7 @@ type Store struct {
 	mu     sync.Mutex
 	jobs   []*storedJob // 严格按作业号（即提交先后）排列
 	byID   map[uint64]*storedJob
-	idem   map[string]uint64 // submitter\x00requestID -> 作业号
+	idem   map[idemKey]uint64 // (提交人, 请求号) -> 作业号
 	nextID uint64
 	closed bool
 
@@ -77,7 +77,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		dir:    dir,
 		jobs:   jobs,
 		byID:   make(map[uint64]*storedJob),
-		idem:   make(map[string]uint64),
+		idem:   make(map[idemKey]uint64),
 		nextID: maxID + 1,
 		now:    wallClock{}.Now,
 		waitCh: make(chan struct{}, 1),
@@ -99,8 +99,15 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) idemKey(submitter, requestID string) string {
-	return submitter + "\x00" + requestID
+// idemKey 是幂等索引的键：提交人与请求号作为两个独立字段比较，
+// 任意字节内容（含零字符）都能精确区分，不做拼接、截断或转义。
+type idemKey struct {
+	submitter string
+	requestID string
+}
+
+func (s *Store) idemKey(submitter, requestID string) idemKey {
+	return idemKey{submitter: submitter, requestID: requestID}
 }
 
 // Close 关闭归档。正在运行的作业会尽快中止并标记为失败（计算被中断），
