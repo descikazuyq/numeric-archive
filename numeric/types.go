@@ -64,9 +64,13 @@ var (
 
 // SubmitRequest 是一次作业提交的原始参数。
 type SubmitRequest struct {
-	// Submitter 为提交人标识，与 RequestID 共同构成幂等键。
+	// Submitter 为提交人标识，与 RequestID 共同构成幂等键。按调用方
+	// 给出的完整字节参与比较与持久化：允许含 U+0000 乃至不能组成合法
+	// UTF-8 的字节，关闭重开归档后仍与提交时逐字节一致。
 	Submitter string
-	// RequestID 为幂等请求号，在同一提交人内有效。
+	// RequestID 为幂等请求号，在同一提交人内有效。字节保留规则与
+	// Submitter 相同；空字符串不启用幂等（只含 U+0000 的非空字符串
+	// 仍启用）。
 	RequestID string
 	// Values 为有符号 64 位整数序列，次序属于提交内容的一部分；为空则拒绝提交。
 	Values []int64

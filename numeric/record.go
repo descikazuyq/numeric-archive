@@ -45,9 +45,12 @@ type storedJob struct {
 type jobRecord struct {
 	Version string `json:"version"`
 
-	ID            uint64  `json:"id"`
-	Submitter     string  `json:"submitter"`
-	RequestID     string  `json:"request_id"`
+	ID uint64 `json:"id"`
+	// Submitter/RequestID 使用 rawText 落盘：标识按调用方给出的完整字节
+	// 往返，允许含 U+0000 与非法 UTF-8 字节，标准 JSON 编码会把后者
+	// 替换成 U+FFFD，导致重开后标识变形并串用记录。
+	Submitter     rawText `json:"submitter"`
+	RequestID     rawText `json:"request_id"`
 	Seed          int64   `json:"seed"`
 	Values        []int64 `json:"values"`
 	HasDependency bool    `json:"has_dependency"`
@@ -64,8 +67,86 @@ type jobRecord struct {
 	FailureReason string `json:"failure_reason,omitempty"`
 	BlockerID     uint64 `json:"blocker_id,omitempty"`
 
-	EffectiveValues []int64  `json:"effective_values,omitempty"`
-	Archive         *Archive `json:"archive,omitempty"`
+	EffectiveValues []int64        `json:"effective_values,omitempty"`
+	Archive         *archiveRecord `json:"archive,omitempty"`
+}
+
+// archiveRecord 是 [Archive] 的落盘镜像：仅把提交人、请求号换成按完整
+// 字节往返的 rawText，其余字段（含 JSON 标签）与 [Archive] 完全一致。
+// 成功状态与归档在同一记录内一次 temp-file + rename 原子写入。
+type archiveRecord struct {
+	JobID uint64 `json:"job_id"`
+
+	Submitter rawText `json:"submitter"`
+	RequestID rawText `json:"request_id"`
+	Seed      int64   `json:"seed"`
+	Values    []int64 `json:"values"`
+
+	HasDependency bool     `json:"has_dependency"`
+	DependencyID  uint64   `json:"dependency_id"`
+	Dependencies  []uint64 `json:"dependencies,omitempty"`
+
+	EffectiveValues []int64 `json:"effective_values"`
+	InputsDigest    string  `json:"inputs_digest"`
+
+	Sum          int64  `json:"sum"`
+	SumOfSquares int64  `json:"sum_of_squares"`
+	ResultDigest string `json:"result_digest"`
+
+	Log      string `json:"log"`
+	Checksum string `json:"checksum"`
+
+	CompletedAt time.Time `json:"completed_at"`
+}
+
+// toArchiveRecord 把内存归档转为落盘镜像。
+func toArchiveRecord(a *Archive) *archiveRecord {
+	if a == nil {
+		return nil
+	}
+	return &archiveRecord{
+		JobID:           a.JobID,
+		Submitter:       rawMarshal(a.Submitter),
+		RequestID:       rawMarshal(a.RequestID),
+		Seed:            a.Seed,
+		Values:          append([]int64(nil), a.Values...),
+		HasDependency:   a.HasDependency,
+		DependencyID:    a.DependencyID,
+		Dependencies:    append([]uint64(nil), a.Dependencies...),
+		EffectiveValues: append([]int64(nil), a.EffectiveValues...),
+		InputsDigest:    a.InputsDigest,
+		Sum:             a.Sum,
+		SumOfSquares:    a.SumOfSquares,
+		ResultDigest:    a.ResultDigest,
+		Log:             a.Log,
+		Checksum:        a.Checksum,
+		CompletedAt:     a.CompletedAt,
+	}
+}
+
+// toArchive 把落盘镜像恢复为内存归档，标识按完整字节还原。
+func (r *archiveRecord) toArchive() *Archive {
+	if r == nil {
+		return nil
+	}
+	return &Archive{
+		JobID:           r.JobID,
+		Submitter:       r.Submitter.String(),
+		RequestID:       r.RequestID.String(),
+		Seed:            r.Seed,
+		Values:          append([]int64(nil), r.Values...),
+		HasDependency:   r.HasDependency,
+		DependencyID:    r.DependencyID,
+		Dependencies:    append([]uint64(nil), r.Dependencies...),
+		EffectiveValues: append([]int64(nil), r.EffectiveValues...),
+		InputsDigest:    r.InputsDigest,
+		Sum:             r.Sum,
+		SumOfSquares:    r.SumOfSquares,
+		ResultDigest:    r.ResultDigest,
+		Log:             r.Log,
+		Checksum:        r.Checksum,
+		CompletedAt:     r.CompletedAt,
+	}
 }
 
 func jobFileName(id uint64) string {
@@ -81,8 +162,8 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 		Version: recordVersion,
 
 		ID:            j.id,
-		Submitter:     j.submitter,
-		RequestID:     j.requestID,
+		Submitter:     rawMarshal(j.submitter),
+		RequestID:     rawMarshal(j.requestID),
 		Seed:          j.seed,
 		Values:        append([]int64(nil), j.values...),
 		HasDependency: len(j.dependencies) > 0,
@@ -97,7 +178,7 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 		BlockerID:     j.blockerID,
 
 		EffectiveValues: append([]int64(nil), j.effectiveValues...),
-		Archive:         j.archive,
+		Archive:         toArchiveRecord(j.archive),
 	}
 	return json.MarshalIndent(&r, "", "  ")
 }
@@ -221,8 +302,8 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		}
 		j := &storedJob{
 			id:           r.ID,
-			submitter:    r.Submitter,
-			requestID:    r.RequestID,
+			submitter:    r.Submitter.String(),
+			requestID:    r.RequestID.String(),
 			seed:         r.Seed,
 			values:       append([]int64(nil), r.Values...),
 			dependencies: deps,
@@ -236,7 +317,7 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			blockerID:     r.BlockerID,
 
 			effectiveValues: append([]int64(nil), r.EffectiveValues...),
-			archive:         r.Archive,
+			archive:         r.Archive.toArchive(),
 		}
 		if j.status == StatusRunning {
 			j.status = StatusFailed
