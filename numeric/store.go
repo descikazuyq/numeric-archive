@@ -534,6 +534,9 @@ func (s *Store) worker() {
 				j.archive = nil
 				j.effectiveValues = nil
 				s.markFailedLocked(j, "结果归档写入失败："+err.Error(), 0)
+				// 归档写入失败与计算溢出失败一样阻断下游：立即级联，
+				// 不能让等待它的作业靠后续其他操作才结束排队。
+				s.cascadeLocked()
 			}
 		}
 		s.notifyLocked()
