@@ -2,8 +2,10 @@ package numeric
 
 import (
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -301,3 +303,106 @@ func TestNoSuccessWithoutArchiveOnDisk(t *testing.T) {
 		t.Fatal("succeeded record on disk must carry full archive")
 	}
 }
+
+// tamperedSuccessRecord 构造一条“数值结果写错但日志、结果摘要与校验值都按
+// 错误数字保持一致”的成功记录——即绕过旧完整性检查的唯一缺口。
+func tamperedSuccessRecord(id uint64, values, effective []int64, seed, sum, sumSquares int64, at time.Time) *storedJob {
+	j := &storedJob{
+		id: id, submitter: "a", requestID: "r" + strconv.FormatUint(id, 10),
+		seed: seed, values: values, effectiveValues: effective,
+		queuedAt: at, startedAt: at.Add(time.Second), finishedAt: at.Add(2 * time.Second),
+		status: StatusSucceeded,
+	}
+	j.archive = newArchive(j, effective, sum, sumSquares, j.finishedAt)
+	return j
+}
+
+// 成功归档的总和/平方和必须是对归档保存的实际输入按既有规则求出的结果；
+// 只让摘要、日志与校验值跟随错误数字保持一致不能再蒙混过关。
+func TestReopenRejectsSuccessArchiveWithWrongResults(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	// 实际输入 [2,-3]：总和应为 -1、平方和应为 13。
+	writeSyntheticRecord(t, dir, tamperedSuccessRecord(1, []int64{2, -3}, []int64{2, -3}, 0, 8, 13, base))
+	writeSyntheticRecord(t, dir, tamperedSuccessRecord(2, []int64{2, -3}, []int64{2, -3}, 0, -1, 12, base.Add(time.Minute)))
+	// 按原有规则总和溢出 int64：回绕后的数字不是有效结果。
+	writeSyntheticRecord(t, dir, tamperedSuccessRecord(3,
+		[]int64{math.MaxInt64, 1}, []int64{math.MaxInt64, 1}, 0, math.MinInt64, 1, base.Add(2*time.Minute)))
+	// 依赖坏记录的排队作业：重开后按既有上游失败处理级联失败。
+	writeSyntheticRecord(t, dir, &storedJob{
+		id: 4, submitter: "a", requestID: "r4",
+		values: []int64{5}, dependencies: []uint64{1},
+		queuedAt: base.Add(3 * time.Minute),
+		status:   StatusQueued,
+	})
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	for _, id := range []uint64{1, 2, 3} {
+		g, err := s.Get(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g.Status != StatusFailed {
+			t.Fatalf("job %d: tampered success kept, status=%s", id, g.Status)
+		}
+		if g.Archive != nil || g.EffectiveValues != nil {
+			t.Fatalf("job %d: failed record must not expose archive/effective inputs", id)
+		}
+		if !strings.Contains(g.FailureReason, "数值结果不可用") {
+			t.Fatalf("job %d: reason must say numeric results unusable, got %q", id, g.FailureReason)
+		}
+	}
+	// 排队的下游沿用既有上游失败处理，不能拿着错误总和继续计算。
+	j4 := waitStatus(t, s, 4, StatusFailed)
+	if j4.BlockerID != 1 || !strings.Contains(j4.FailureReason, "作业 1") {
+		t.Fatalf("downstream: blocker=%d reason=%q", j4.BlockerID, j4.FailureReason)
+	}
+}
+
+// 合法归档不受新增数值核验影响：含依赖追加后的实际输入按既有规则复算一致，
+// 重开后仍原样可用，摘要与校验值不变。
+func TestReopenKeepsValidArchivesUnderResultCheck(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	// id 1：实际输入 [2,-3]，总和 -1、平方和 13。
+	up := tamperedSuccessRecord(1, []int64{2, -3}, []int64{2, -3}, 0, -1, 13, base)
+	writeSyntheticRecord(t, dir, up)
+	// id 2：依赖 id 1，实际输入已含追加的上游总和 -1（不能再追加一次）。
+	down := &storedJob{
+		id: 2, submitter: "a", requestID: "r2",
+		values: []int64{5}, dependencies: []uint64{1},
+		effectiveValues: []int64{5, -1},
+		queuedAt:        base.Add(time.Minute), startedAt: base.Add(2 * time.Minute),
+		finishedAt: base.Add(3 * time.Minute),
+		status:     StatusSucceeded,
+	}
+	down.archive = newArchive(down, down.effectiveValues, 4, 26, down.finishedAt)
+	writeSyntheticRecord(t, dir, down)
+	wantChecksum := down.archive.Checksum
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	j1, _ := s.Get(1)
+	if j1.Status != StatusSucceeded || j1.Archive == nil ||
+		j1.Archive.Sum != -1 || j1.Archive.SumOfSquares != 13 {
+		t.Fatalf("valid archive must survive: %s %+v", j1.Status, j1.Archive)
+	}
+	j2, _ := s.Get(2)
+	if j2.Status != StatusSucceeded || j2.Archive == nil ||
+		j2.Archive.Sum != 4 || j2.Archive.SumOfSquares != 26 {
+		t.Fatalf("valid dependent archive must survive: %s %+v", j2.Status, j2.Archive)
+	}
+	if j2.Archive.Checksum != wantChecksum {
+		t.Fatal("checksum must not be recomputed on reopen")
+	}
+}
+

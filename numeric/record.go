@@ -243,7 +243,8 @@ func syncDir(dir string) {
 //
 // 恢复规则：
 //   - 上次关闭时仍为 running 的作业标记为失败，原因是计算被中断；
-//   - 成功记录缺少归档或校验值对不上时 fail-closed 地标记为失败，
+//   - 成功记录缺少归档、校验值对不上，或归档中的总和/平方和与按既有规则
+//     对实际输入（含溢出判定）复算的结果不符时，fail-closed 地标记为失败，
 //     维持“成功必有完整归档”的不变量。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
@@ -339,7 +340,7 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		}
 		if j.status == StatusSucceeded && !archiveIntact(j) {
 			j.status = StatusFailed
-			j.failureReason = "归档不完整或校验值不一致，成功结果不可用"
+			j.failureReason = "归档不完整、校验值不一致或数值结果与计算规则不符，成功归档的数值结果不可用"
 			if j.finishedAt.IsZero() {
 				j.finishedAt = time.Now().UTC()
 			}
@@ -365,7 +366,9 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	return jobs, maxID, nil
 }
 
-// archiveIntact 复算成功归档的全部确定性字段，任何不一致都视为不可用。
+// archiveIntact 复算成功归档的全部确定性字段，并核验归档中的总和与平方和
+// 确实是按既有计算规则作用于实际输入的结果（含 int64 溢出判定）；
+// 任何不一致都视为不可用。
 func archiveIntact(j *storedJob) bool {
 	a := j.archive
 	if a == nil {
@@ -419,6 +422,15 @@ func archiveIntact(j *storedJob) bool {
 		return false
 	}
 	if a.Checksum != checksumHex(j.effectiveValues, j.seed, a.Sum, a.SumOfSquares, a.Log, a.ResultDigest) {
+		return false
+	}
+	// 数值结果本身必须是对归档保存的实际输入（已含按顺序追加的上游总和，
+	// 不可再追加一次）按既有规则求总和与平方和的结果：日志、结果摘要与
+	// 校验值可以围绕错误的数字保持自洽，不能替代这一步核验。按原有规则
+	// 会造成有符号 64 位溢出的输入同样不能保留成功状态——回绕后的数字
+	// 不是有效结果。
+	sum, sumSquares, _, ok := computeResult(j.effectiveValues, j.seed, nil)
+	if !ok || sum != a.Sum || sumSquares != a.SumOfSquares {
 		return false
 	}
 	return true
