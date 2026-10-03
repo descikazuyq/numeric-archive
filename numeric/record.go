@@ -1,6 +1,7 @@
 package numeric
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,7 +10,71 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
+
+// rawBase64Prefix 标记 _raw 字段中的值是原始字节的 base64 编码。
+// ':' 不在 base64 字母表内，普通文本（即使本身像 base64，如 "abcd"）
+// 不会以该前缀开头；而 _raw 字段由本版本写入，旧归档不含此字段，
+// 因此标记无歧义。
+const rawBase64Prefix = "base64:"
+
+// unmarshalRaw 恢复 rawIdentity 写出的字段；带 base64 前缀的兜底值解码回
+// 原始字节，普通 JSON 字符串原样返回。
+func unmarshalRaw(s string) (string, error) {
+	if strings.HasPrefix(s, rawBase64Prefix) {
+		b, err := base64.StdEncoding.DecodeString(s[len(rawBase64Prefix):])
+		if err != nil {
+			return "", fmt.Errorf("numeric: 标识原始字节解码失败: %w", err)
+		}
+		return string(b), nil
+	}
+	return s, nil
+}
+
+// identityRaw 携带提交人、请求号的完整字节兜底表示。只有当对应字段含
+// 非法 UTF-8 字节时相应成员才非空；普通文本记录不写这两个字段，
+// 保持旧格式归档可直接打开。
+type identityRaw struct {
+	Submitter string `json:"submitter_raw,omitempty"`
+	RequestID string `json:"request_id_raw,omitempty"`
+}
+
+// rawIdentity 在标识含非法 UTF-8 字节时构造完整字节兜底字段；
+// 两个标识都是合法 UTF-8 时返回 nil，记录与旧格式完全一致。
+func rawIdentity(submitter, requestID string) *identityRaw {
+	if utf8.ValidString(submitter) && utf8.ValidString(requestID) {
+		return nil
+	}
+	raw := &identityRaw{}
+	if !utf8.ValidString(submitter) {
+		raw.Submitter = rawBase64Prefix + base64.StdEncoding.EncodeToString([]byte(submitter))
+	}
+	if !utf8.ValidString(requestID) {
+		raw.RequestID = rawBase64Prefix + base64.StdEncoding.EncodeToString([]byte(requestID))
+	}
+	return raw
+}
+
+// resolveIdentity 恢复提交人、请求号：_raw 兜底字段存在且非空时以其
+// 解码出的完整字节为准，否则使用 JSON 字符串字段（旧归档与普通文本）。
+func resolveIdentity(plainSub, plainReq string, raw *identityRaw) (string, string, error) {
+	var err error
+	sub, req := plainSub, plainReq
+	if raw != nil {
+		if raw.Submitter != "" {
+			if sub, err = unmarshalRaw(raw.Submitter); err != nil {
+				return "", "", err
+			}
+		}
+		if raw.RequestID != "" {
+			if req, err = unmarshalRaw(raw.RequestID); err != nil {
+				return "", "", err
+			}
+		}
+	}
+	return sub, req, nil
+}
 
 // recordVersion 是落盘记录格式的版本标记。
 const recordVersion = "numeric-job-v1"
@@ -45,13 +110,16 @@ type storedJob struct {
 type jobRecord struct {
 	Version string `json:"version"`
 
-	ID            uint64  `json:"id"`
-	Submitter     string  `json:"submitter"`
-	RequestID     string  `json:"request_id"`
-	Seed          int64   `json:"seed"`
-	Values        []int64 `json:"values"`
-	HasDependency bool    `json:"has_dependency"`
-	DependencyID  uint64  `json:"dependency_id"`
+	ID        uint64 `json:"id"`
+	Submitter string `json:"submitter"`
+	RequestID string `json:"request_id"`
+	// IdentityRaw 仅在提交人或请求号含非法 UTF-8 字节时出现，按完整字节
+	// 保真恢复标识；合法 UTF-8（含 U+0000）时缺省，记录与旧格式一致。
+	IdentityRaw   *identityRaw `json:"identity_raw,omitempty"`
+	Seed          int64        `json:"seed"`
+	Values        []int64      `json:"values"`
+	HasDependency bool         `json:"has_dependency"`
+	DependencyID  uint64       `json:"dependency_id"`
 	// Dependencies 为有序直接上游作业号；旧格式记录无此字段，
 	// 恢复时由 HasDependency/DependencyID 推导。
 	Dependencies []uint64 `json:"dependencies,omitempty"`
@@ -83,6 +151,7 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 		ID:            j.id,
 		Submitter:     j.submitter,
 		RequestID:     j.requestID,
+		IdentityRaw:   rawIdentity(j.submitter, j.requestID),
 		Seed:          j.seed,
 		Values:        append([]int64(nil), j.values...),
 		HasDependency: len(j.dependencies) > 0,
@@ -208,6 +277,22 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		if r.Version != recordVersion {
 			return nil, 0, fmt.Errorf("numeric: 记录 %s 版本不受支持: %s", name, r.Version)
 		}
+		// 提交人、请求号按完整字节恢复：含非法 UTF-8 字节时以
+		// identity_raw 兜底字段为准，普通文本（含 U+0000）与旧归档原样使用。
+		submitter, requestID, err := resolveIdentity(r.Submitter, r.RequestID, r.IdentityRaw)
+		if err != nil {
+			return nil, 0, fmt.Errorf("numeric: 记录 %s 标识损坏: %w", name, err)
+		}
+		// 成功归档内嵌同一份标识，同样按其自身兜底字段恢复，保证顶层记录
+		// 与归档中的参数逐字节一致。
+		if r.Archive != nil {
+			aSub, aReq, aErr := resolveIdentity(r.Archive.Submitter, r.Archive.RequestID, r.Archive.IdentityRaw)
+			if aErr != nil {
+				return nil, 0, fmt.Errorf("numeric: 记录 %s 归档标识损坏: %w", name, aErr)
+			}
+			r.Archive.Submitter = aSub
+			r.Archive.RequestID = aReq
+		}
 		switch r.Status {
 		case StatusQueued, StatusRunning, StatusSucceeded, StatusFailed, StatusCanceled:
 		default:
@@ -221,8 +306,8 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		}
 		j := &storedJob{
 			id:           r.ID,
-			submitter:    r.Submitter,
-			requestID:    r.RequestID,
+			submitter:    submitter,
+			requestID:    requestID,
 			seed:         r.Seed,
 			values:       append([]int64(nil), r.Values...),
 			dependencies: deps,

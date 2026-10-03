@@ -29,9 +29,10 @@ func WithClock(c Clock) Option {
 //
 // 一次只运行一个作业；所有方法可被多个 goroutine 并发调用。
 // idemIdentity 是幂等作用域（提交人, 请求号）的复合键。两个字段都按调用方
-// 给出的完整字符串逐字节参与比较，允许包含 U+0000。不能用分隔符把两个字段
-// 拼成单个字符串：提交人 "a"、请求号 "b\x00c" 与提交人 "a\x00b"、请求号 "c"
-// 在任何分隔符方案下都会产生歧义（分隔符本身可以出现在字段内部）。
+// 给出的完整字符串逐字节参与比较，允许包含 U+0000 与非法 UTF-8 字节
+// （后者靠记录中的 identity_raw 兜底字段跨重开保真）。不能用分隔符把两个
+// 字段拼成单个字符串：提交人 "a"、请求号 "b\x00c" 与提交人 "a\x00b"、
+// 请求号 "c" 在任何分隔符方案下都会产生歧义（分隔符本身可以出现在字段内部）。
 type idemIdentity struct {
 	submitter string
 	requestID string
@@ -583,6 +584,7 @@ func newArchive(j *storedJob, effective []int64, sum, sumSquares int64, complete
 		JobID:           j.id,
 		Submitter:       j.submitter,
 		RequestID:       j.requestID,
+		IdentityRaw:     rawIdentity(j.submitter, j.requestID),
 		Seed:            j.seed,
 		Values:          append([]int64(nil), j.values...),
 		HasDependency:   len(j.dependencies) > 0,
@@ -637,6 +639,10 @@ func (s *Store) viewLocked(j *storedJob) *Job {
 		a.Values = append([]int64(nil), j.archive.Values...)
 		a.EffectiveValues = append([]int64(nil), j.archive.EffectiveValues...)
 		a.Dependencies = append([]uint64(nil), j.archive.Dependencies...)
+		if j.archive.IdentityRaw != nil {
+			raw := *j.archive.IdentityRaw
+			a.IdentityRaw = &raw
+		}
 		v.Archive = &a
 	}
 	return v

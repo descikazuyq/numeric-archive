@@ -144,12 +144,15 @@ type Archive struct {
 	JobID uint64 `json:"job_id"`
 
 	// 原始提交参数。
-	Submitter     string  `json:"submitter"`
-	RequestID     string  `json:"request_id"`
-	Seed          int64   `json:"seed"`
-	Values        []int64 `json:"values"`
-	HasDependency bool    `json:"has_dependency"`
-	DependencyID  uint64  `json:"dependency_id"`
+	Submitter string `json:"submitter"`
+	RequestID string `json:"request_id"`
+	// IdentityRaw 与 jobRecord 同义：标识含非法 UTF-8 字节时按完整字节
+	// 保真，保证重开归档后归档中的提交人、请求号与提交时逐字节一致。
+	IdentityRaw   *identityRaw `json:"identity_raw,omitempty"`
+	Seed          int64        `json:"seed"`
+	Values        []int64      `json:"values"`
+	HasDependency bool         `json:"has_dependency"`
+	DependencyID  uint64       `json:"dependency_id"`
 	// Dependencies 为有序直接上游作业号（保持提交顺序）；单依赖方式提交的
 	// 作业此处只含一个作业号。上游作业号不参与摘要与校验值。
 	Dependencies []uint64 `json:"dependencies,omitempty"`
