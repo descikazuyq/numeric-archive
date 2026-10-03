@@ -243,9 +243,9 @@ func syncDir(dir string) {
 //
 // 恢复规则：
 //   - 上次关闭时仍为 running 的作业标记为失败，原因是计算被中断；
-//   - 成功记录缺少归档、校验值对不上，或归档数值结果与有效输入按计算
-//     规则应得的结果不符时，fail-closed 地标记为失败，
-//     维持“成功必有完整归档”的不变量。
+//   - 成功记录缺少归档、校验值对不上，实际输入与原始参数或直接依赖数量
+//     不对应，或归档数值结果与有效输入按计算规则应得的结果不符时，
+//     fail-closed 地标记为失败，维持“成功必有完整归档”的不变量。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -339,13 +339,22 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			}
 		}
 		if j.status == StatusSucceeded {
-			// 除完整性外，归档中的数值结果还必须与有效输入按既有计算规则
-			// 应得的结果一致：日志、摘要与校验值都可能与错误数字自洽，
-			// 只有按保存的实际输入复算才能识别。任一不符合都按损坏归档处理。
+			// 除完整性外，还必须满足两条独立的对应/复算规则：
+			//  1. 实际输入与原始参数、直接依赖数量逐项对应——原始序列非空且
+			//     按原次序完整出现在实际输入开头，总长度恰为原始长度加上直接
+			//     依赖数；摘要、日志、校验值只与“实际输入”绑定，换成另一份
+			//     序列（如 [-3,2] 冒充 [2,-3]）仍能全套自洽，只有按位置比对
+			//     原始参数与依赖数量才能识别。
+			//  2. 归档中的数值结果必须与实际输入按既有计算规则应得的结果一致：
+			//     日志、摘要与校验值都可能与错误数字自洽，只有按保存的实际
+			//     输入复算才能识别。
+			// 任一不符合都按损坏归档处理。
 			var invalidReason string
 			switch {
 			case !archiveIntact(j):
 				invalidReason = "归档不完整或校验值不一致，成功结果不可用"
+			case !effectiveInputsCorrespond(j):
+				invalidReason = "实际输入与原始参数或依赖数量不符，成功结果不可用"
 			case !archiveResultsValid(j):
 				invalidReason = "归档数值结果与有效输入按计算规则应得的结果不符，成功结果不可用"
 			}
@@ -452,4 +461,37 @@ func archiveResultsValid(j *storedJob) bool {
 		return false
 	}
 	return a.Sum == sum && a.SumOfSquares == sumSquares
+}
+
+// effectiveInputsCorrespond 校验成功记录中实际参与计算的输入与原始提交
+// 参数、直接依赖数量之间的对应关系：
+//   - 原始序列必须非空；
+//   - 原始序列逐项、按原次序完整出现在实际输入的开头——负数、零与重复
+//     整数一律按位置判断，不比较总和或平方和，也不忽略次序；
+//   - 实际输入总长度必须恰好等于原始序列长度加直接依赖数量。无依赖时两份
+//     序列必须完全相同；有单个或多个依赖时，原始部分之后只能保留每个直接
+//     上游各占一个位置的追加部分，不能借依赖之名替换、截短原始部分，也不
+//     能多出未记录的输入。
+//
+// 该规则防止把另一份输入的自洽结果挂在原始参数下：例如原始参数为 [2,-3]
+// 而实际输入被换成 [-3,2] 时，总和与平方和不变，摘要、日志与校验值又只
+// 绑定实际输入，全套字段仍会自洽，只有按位置比对原始参数并核对追加数量
+// 才能识别。旧的单依赖记录恢复后依赖列表恰含一个作业号，按同一含义判断。
+//
+// 调用前须已通过 archiveIntact（保证 archive 非空、实际输入非空且归档内
+// 副本与顶层一致）。
+func effectiveInputsCorrespond(j *storedJob) bool {
+	n := len(j.values)
+	if n == 0 {
+		return false
+	}
+	if len(j.effectiveValues) != n+len(j.dependencies) {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if j.effectiveValues[i] != j.values[i] {
+			return false
+		}
+	}
+	return true
 }
