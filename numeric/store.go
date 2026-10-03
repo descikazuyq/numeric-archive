@@ -264,9 +264,14 @@ func (s *Store) Get(id uint64) (*Job, error) {
 
 // Cancel 请求取消作业。
 //
-// 排队或运行中的作业都可以取消；取消一旦返回成功，该作业及依赖它的作业
-// 都不会再产生成功归档。重复取消已取消的作业仍返回成功；对已成功或已
-// 失败的作业取消返回 [ErrNotCancellable]，原结果保持不变。
+// 排队或运行中的作业都可以取消；取消以“取消状态已成功保存进归档记录”为生效
+// 条件：只有原子替换原记录成功后，返回结果、可查询状态与磁盘记录才一致地呈现
+// 为取消，该作业及依赖它的作业才不会再产生成功归档。若取消记录无法创建临时
+// 文件或无法替换原记录，返回的是实际保存错误，作业保持原状——不新增完成时间、
+// 不清空原有信息、不中止正在运行的计算、不级联标记下游，排队与调度规则不变；
+// 写入条件恢复后对仍处于排队或运行状态的同一作业再次取消会重新尝试保存。
+// 重复取消已取消的作业仍返回成功；对已成功或已失败的作业取消返回
+// [ErrNotCancellable]，原结果保持不变（计算在两次取消请求之间完成时亦然）。
 func (s *Store) Cancel(id uint64) (*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -285,8 +290,17 @@ func (s *Store) Cancel(id uint64) (*Job, error) {
 			fmt.Errorf("%w：作业 %d 当前状态为 %s", ErrNotCancellable, id, j.status)
 	}
 
-	// queued / running：立刻把终态落盘，使“已确认的取消”不会因崩溃丢失。
+	// queued / running：先把取消终态写入原记录，确认原子替换成功后才让取消
+	// 生效。持锁期间外界观察不到中间态；若创建临时记录或替换原记录失败，
+	// 必须逐字段回滚，内存与磁盘都保持取消前的原状并返回实际保存错误，
+	// 不能把这次取消当作已完成。
 	now := s.now().UTC()
+	prevStatus := j.status
+	prevFinishedAt := j.finishedAt
+	prevReason := j.failureReason
+	prevBlocker := j.blockerID
+	prevEffective := j.effectiveValues
+	prevArchive := j.archive
 	j.status = StatusCanceled
 	j.failureReason = ""
 	j.blockerID = 0
@@ -295,10 +309,18 @@ func (s *Store) Cancel(id uint64) (*Job, error) {
 	}
 	j.effectiveValues = nil
 	j.archive = nil
-	j.canceled.Store(true)
 	if err := s.persist(j); err != nil {
+		j.status = prevStatus
+		j.finishedAt = prevFinishedAt
+		j.failureReason = prevReason
+		j.blockerID = prevBlocker
+		j.effectiveValues = prevEffective
+		j.archive = prevArchive
 		return nil, err
 	}
+
+	// 取消已确认保存：提交终态，让正在运行的计算尽快中止，并级联标记下游。
+	j.canceled.Store(true)
 	// 依赖它的等待者一并失败，且继续向更下游传播。
 	s.cascadeLocked()
 	s.notifyLocked()
