@@ -286,6 +286,13 @@ func (s *Store) Cancel(id uint64) (*Job, error) {
 	}
 
 	// queued / running：立刻把终态落盘，使“已确认的取消”不会因崩溃丢失。
+	// 取消以落盘成功为生效条件：先改内存再写盘，写盘失败时完整回滚，
+	// 本次取消不生效——不置取消标记（运行中的计算不被中止）、不新增
+	// 完成时间、不改动既有状态，调用方收到的是真实的保存错误。
+	prevStatus := j.status
+	prevFinishedAt := j.finishedAt
+	prevEffective := j.effectiveValues
+	prevArchive := j.archive
 	now := s.now().UTC()
 	j.status = StatusCanceled
 	j.failureReason = ""
@@ -295,10 +302,15 @@ func (s *Store) Cancel(id uint64) (*Job, error) {
 	}
 	j.effectiveValues = nil
 	j.archive = nil
-	j.canceled.Store(true)
 	if err := s.persist(j); err != nil {
+		j.status = prevStatus
+		j.finishedAt = prevFinishedAt
+		j.effectiveValues = prevEffective
+		j.archive = prevArchive
 		return nil, err
 	}
+	// 取消已确认落盘：中止运行中的计算，并让依赖它的等待者失败。
+	j.canceled.Store(true)
 	// 依赖它的等待者一并失败，且继续向更下游传播。
 	s.cascadeLocked()
 	s.notifyLocked()

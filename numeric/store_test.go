@@ -2,6 +2,7 @@ package numeric
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -631,6 +632,95 @@ func TestCancelQueuedBeforeRun(t *testing.T) {
 	j, _ := s.Get(second.ID)
 	if j.Status != StatusCanceled || j.Archive != nil {
 		t.Fatalf("queued cancel: status=%s archive=%v", j.Status, j.Archive)
+	}
+}
+
+func TestCancelPersistFailureDoesNotTakeEffect(t *testing.T) {
+	s, _ := openTestStore(t)
+	started, block, release, _, _ := gateCompute(t, s)
+	block(1, 2)
+
+	first := mustSubmit(t, s, SubmitRequest{Submitter: "a", Values: []int64{1}})
+	waitStarted(t, started, first.ID) // first 运行中
+	second := mustSubmit(t, s, SubmitRequest{Submitter: "a", Values: []int64{2}})
+	dep := mustSubmit(t, s, SubmitRequest{ // 等 second 的结果
+		Submitter: "a", Values: []int64{3},
+		HasDependency: true, DependencyID: second.ID,
+	})
+
+	// 归档目录暂时不可写：取消记录无法落盘。
+	dir := s.Dir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod ro: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	// 取消排队作业：必须返回保存错误，且状态、完成时间、下游全部不变。
+	if _, err := s.Cancel(second.ID); err == nil {
+		t.Fatal("cancel with unwritable dir must return the persist error")
+	}
+	j, err := s.Get(second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Status != StatusQueued || !j.FinishedAt.IsZero() || j.WaitReason != WaitSlot {
+		t.Fatalf("failed cancel changed job: status=%s finished=%v reason=%q",
+			j.Status, j.FinishedAt, j.WaitReason)
+	}
+	// 未生效的取消不能被当成已完成：再次取消仍应尝试保存（仍失败），而非直接成功。
+	if _, err := s.Cancel(second.ID); err == nil {
+		t.Fatal("unsaved cancel must not be treated as done on retry")
+	}
+	// 下游不能仅因这次未生效的取消被标记失败。
+	if dj, _ := s.Get(dep.ID); dj.Status != StatusQueued {
+		t.Fatalf("dependent failed by an ineffective cancel: %s", dj.Status)
+	}
+	// 取消运行中的作业失败同样不生效，且不得中止正在进行的计算。
+	if _, err := s.Cancel(first.ID); err == nil {
+		t.Fatal("cancel running with unwritable dir must return the persist error")
+	}
+	if fj, _ := s.Get(first.ID); fj.Status != StatusRunning {
+		t.Fatalf("running job changed by failed cancel: %s", fj.Status)
+	}
+
+	// 写入条件恢复后再次取消：重新尝试保存并生效。
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("chmod rw: %v", err)
+	}
+	cj, err := s.Cancel(second.ID)
+	if err != nil || cj.Status != StatusCanceled {
+		t.Fatalf("cancel after recovery: %v %+v", err, cj)
+	}
+	// 已确认的取消允许重复请求返回成功。
+	if again, err := s.Cancel(second.ID); err != nil || again.Status != StatusCanceled {
+		t.Fatalf("repeat confirmed cancel: %v %+v", err, again)
+	}
+	// 下游按现有规则失败并指出阻断作业。
+	dj := waitStatus(t, s, dep.ID, StatusFailed)
+	if dj.BlockerID != second.ID || !strings.Contains(dj.FailureReason, "取消") {
+		t.Fatalf("dependent blocker=%d reason=%q, want blocked by canceled %d",
+			dj.BlockerID, dj.FailureReason, second.ID)
+	}
+	// 运行中的 first 未受之前失败的取消影响，照常成功。
+	release(first.ID)
+	waitStatus(t, s, first.ID, StatusSucceeded)
+
+	// 重新打开归档：已确认的取消与未受影响的完成结果都保留。
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	got, _ := s2.Get(second.ID)
+	if got.Status != StatusCanceled {
+		t.Fatalf("reopened status=%s, want canceled", got.Status)
+	}
+	got1, _ := s2.Get(first.ID)
+	if got1.Status != StatusSucceeded || got1.Archive == nil {
+		t.Fatalf("reopened first: status=%s archive=%v", got1.Status, got1.Archive)
 	}
 }
 
