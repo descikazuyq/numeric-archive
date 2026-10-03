@@ -243,9 +243,9 @@ func syncDir(dir string) {
 //
 // 恢复规则：
 //   - 上次关闭时仍为 running 的作业标记为失败，原因是计算被中断；
-//   - 成功记录缺少归档、校验值对不上，或归档数值结果与有效输入按计算
-//     规则应得的结果不符时，fail-closed 地标记为失败，
-//     维持“成功必有完整归档”的不变量。
+//   - 成功记录缺少归档、校验值对不上、实际输入与原始参数或依赖数量不对应，
+//     或归档数值结果与有效输入按计算规则应得的结果不符时，
+//     fail-closed 地标记为失败，维持“成功必有完整归档”的不变量。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -340,12 +340,15 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		}
 		if j.status == StatusSucceeded {
 			// 除完整性外，归档中的数值结果还必须与有效输入按既有计算规则
-			// 应得的结果一致：日志、摘要与校验值都可能与错误数字自洽，
-			// 只有按保存的实际输入复算才能识别。任一不符合都按损坏归档处理。
+			// 应得的结果一致，且有效输入本身必须与原始参数、依赖数量对应：
+			// 日志、摘要与校验值都可能与另一份输入自洽，只有逐项核对原始
+			// 序列并按保存的实际输入复算才能识别。任一不符合都按损坏归档处理。
 			var invalidReason string
 			switch {
 			case !archiveIntact(j):
 				invalidReason = "归档不完整或校验值不一致，成功结果不可用"
+			case !effectiveInputsMatch(j):
+				invalidReason = "实际输入与原始参数或依赖数量不符，成功结果不可用"
 			case !archiveResultsValid(j):
 				invalidReason = "归档数值结果与有效输入按计算规则应得的结果不符，成功结果不可用"
 			}
@@ -433,6 +436,28 @@ func archiveIntact(j *storedJob) bool {
 	}
 	if a.Checksum != checksumHex(j.effectiveValues, j.seed, a.Sum, a.SumOfSquares, a.Log, a.ResultDigest) {
 		return false
+	}
+	return true
+}
+
+// effectiveInputsMatch 校验保存的实际输入与原始参数、依赖数量之间的对应关系：
+// 原始序列必须非空，并且逐项、按原次序出现在实际输入的开头；实际输入的总长度
+// 必须恰好等于原始序列长度加直接依赖数量（每个直接上游恰好追加一个总和）。
+// 无依赖时两份序列必须完全相同。负数、零与重复整数同样按位置判断——
+// 只比较总和、平方和或忽略次序都会放过被替换的输入。
+//
+// 调用前须已通过 archiveIntact（保证 archive 非空且归档内字段与记录一致）。
+func effectiveInputsMatch(j *storedJob) bool {
+	if len(j.values) == 0 {
+		return false
+	}
+	if len(j.effectiveValues) != len(j.values)+len(j.dependencies) {
+		return false
+	}
+	for i, v := range j.values {
+		if j.effectiveValues[i] != v {
+			return false
+		}
 	}
 	return true
 }
