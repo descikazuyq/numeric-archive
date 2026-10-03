@@ -243,7 +243,8 @@ func syncDir(dir string) {
 //
 // 恢复规则：
 //   - 上次关闭时仍为 running 的作业标记为失败，原因是计算被中断；
-//   - 成功记录缺少归档或校验值对不上时 fail-closed 地标记为失败，
+//   - 成功记录缺少归档、校验值对不上，或归档数值结果与有效输入按计算
+//     规则应得的结果不符时，fail-closed 地标记为失败，
 //     维持“成功必有完整归档”的不变量。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
@@ -337,16 +338,28 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 				_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
 			}
 		}
-		if j.status == StatusSucceeded && !archiveIntact(j) {
-			j.status = StatusFailed
-			j.failureReason = "归档不完整或校验值不一致，成功结果不可用"
-			if j.finishedAt.IsZero() {
-				j.finishedAt = time.Now().UTC()
+		if j.status == StatusSucceeded {
+			// 除完整性外，归档中的数值结果还必须与有效输入按既有计算规则
+			// 应得的结果一致：日志、摘要与校验值都可能与错误数字自洽，
+			// 只有按保存的实际输入复算才能识别。任一不符合都按损坏归档处理。
+			var invalidReason string
+			switch {
+			case !archiveIntact(j):
+				invalidReason = "归档不完整或校验值不一致，成功结果不可用"
+			case !archiveResultsValid(j):
+				invalidReason = "归档数值结果与有效输入按计算规则应得的结果不符，成功结果不可用"
 			}
-			j.effectiveValues = nil
-			j.archive = nil
-			if data, err := encodeRecord(j); err == nil {
-				_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
+			if invalidReason != "" {
+				j.status = StatusFailed
+				j.failureReason = invalidReason
+				if j.finishedAt.IsZero() {
+					j.finishedAt = time.Now().UTC()
+				}
+				j.effectiveValues = nil
+				j.archive = nil
+				if data, err := encodeRecord(j); err == nil {
+					_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
+				}
 			}
 		}
 		jobs = append(jobs, j)
@@ -422,4 +435,21 @@ func archiveIntact(j *storedJob) bool {
 		return false
 	}
 	return true
+}
+
+// archiveResultsValid 按既有计算规则对归档保存的实际输入（effectiveValues，
+// 已含按顺序追加的上游总和，不再追加）复算总和与平方和，归档中的数值结果
+// 必须与复算结果完全一致。完整性检查只验证日志、摘要与校验值和所写数字
+// 自洽，无法识别“数字本身写错但全套字段一致”的记录，因此这里以计算规则
+// 为准。实际输入按规则会造成 int64 溢出时 ok 为 false，任何数值结果
+// （包括回绕后的值）都不能作为有效成功结果保留。
+//
+// 调用前须已通过 archiveIntact（保证 archive 非空且有效输入非空）。
+func archiveResultsValid(j *storedJob) bool {
+	a := j.archive
+	sum, sumSquares, _, ok := computeResult(j.effectiveValues, j.seed, nil)
+	if !ok {
+		return false
+	}
+	return a.Sum == sum && a.SumOfSquares == sumSquares
 }
