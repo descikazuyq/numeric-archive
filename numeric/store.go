@@ -50,6 +50,12 @@ type Store struct {
 	// 必须在任何 Submit 之前（Open 之后立即）设置；worker 只会在收到
 	// Submit 的唤醒之后读取它，因此与设置之间存在 happens-before 关系。
 	compute func(id uint64, inputs []int64, seed int64, canceled func() bool) (sum, sumSquares int64, reason string, ok bool)
+
+	// persistFault 仅用于包内确定性测试：若非 nil，每次 persist 都会先调用它，
+	// 返回非 nil 即模拟该次记录保存失败（如同临时记录无法创建或原记录无法替换）。
+	// 生产代码恒为 nil。钩子可按作业号与“待保存的当前状态”只让某一次写入失败
+	// （例如仅让成功归档写入失败），而让其余记录照常落盘。
+	persistFault func(j *storedJob) error
 }
 
 // Open 打开（必要时创建）目录 dir 并恢复其中的全部作业记录。
@@ -534,6 +540,9 @@ func (s *Store) worker() {
 				j.archive = nil
 				j.effectiveValues = nil
 				s.markFailedLocked(j, "结果归档写入失败："+err.Error(), 0)
+				// 归档写入失败与计算溢出等失败同等对待：立即沿依赖链阻断所有仍在
+				// 排队等待它的作业，使等待者无需等到下一次提交/取消即进入失败终态。
+				s.cascadeLocked()
 			}
 		}
 		s.notifyLocked()

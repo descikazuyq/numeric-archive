@@ -112,6 +112,12 @@ func depID(j *storedJob) uint64 {
 
 // persist 在已持锁的情况下原子写一条作业记录。
 func (s *Store) persist(j *storedJob) error {
+	// 测试用故障注入点（生产代码中 persistFault 恒为 nil）。
+	if s.persistFault != nil {
+		if err := s.persistFault(j); err != nil {
+			return err
+		}
+	}
 	data, err := encodeRecord(j)
 	if err != nil {
 		return err
