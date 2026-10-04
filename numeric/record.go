@@ -243,15 +243,18 @@ func syncDir(dir string) {
 //
 // 恢复规则：
 //   - 上次关闭时仍为 running 的作业标记为失败，原因是计算被中断；
-//   - 成功记录缺少归档、校验值对不上，实际输入与原始参数或直接依赖数量
-//     不对应，或归档数值结果与有效输入按计算规则应得的结果不符时，
-//     fail-closed 地标记为失败，维持“成功必有完整归档”的不变量；
+//   - 成功记录缺少归档、校验值对不上，依赖列表重复引用同一直接上游作业号，
+//     实际输入与原始参数或直接依赖数量不对应，或归档数值结果与有效输入按
+//     计算规则应得的结果不符时，fail-closed 地标记为失败，维持“成功必有
+//     完整归档”的不变量；
 //   - 有依赖的成功记录还要求每个直接上游都存在、恢复后仍是带完整归档的
 //     成功状态，且实际输入的追加部分逐项等于这些上游按保存的依赖顺序
 //     排列的总和；上游不可用的同样改判为失败，其失败原因指出直接上游、
 //     BlockerID 沿链条保留最初的根因（与运行中依赖失败同一规则）；
 //     仅追加输入对不上而上游全部有效的属于本作业自身归档有误，BlockerID
-//     保持 0。仍在排队的作业在同一趟升序扫描中按既有依赖规则级联失败。
+//     保持 0。排队记录的依赖列表若重复引用同一作业号，同样在恢复时直接
+//     判失败（BlockerID 为 0），不再等待或开始计算；仍在排队的其他作业
+//     在同一趟升序扫描中按既有依赖规则级联失败。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -334,7 +337,14 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			failRestoredJob(dir, j, "计算被中断：归档上次关闭时作业仍在运行", 0)
 		}
 		if j.status == StatusSucceeded {
-			// 除完整性外，还必须满足两条独立的对应/复算规则：
+			// 除完整性外，还必须满足三条独立的对应/复算规则：
+			//  0. 依赖列表自身合法——同一直接上游作业号不能出现两次（相邻或隔着
+			//     其他上游都算）。这与提交时 validateDependenciesLocked 的唯一性
+			//     要求一致；旧版本或被改动的记录可能保存了重复引用，此时即使
+			//     追加值、总和、平方和、摘要、日志与校验值全部自洽，也不能当作
+			//     合法成功归档（重复引用会把同一上游总和追加两次）。这属于本作业
+			//     记录自身有误，在任何上游可用性核对之前判定，BlockerID 为 0，
+			//     不把被重复引用的有效上游判成失败。
 			//  1. 实际输入与原始参数、直接依赖数量逐项对应——原始序列非空且
 			//     按原次序完整出现在实际输入开头，总长度恰为原始长度加上直接
 			//     依赖数；摘要、日志、校验值只与“实际输入”绑定，换成另一份
@@ -343,16 +353,17 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			//  2. 归档中的数值结果必须与实际输入按既有计算规则应得的结果一致：
 			//     日志、摘要与校验值都可能与错误数字自洽，只有按保存的实际
 			//     输入复算才能识别。
-			// 任一不符合都按损坏归档处理。第三条规则——追加部分逐项等于各
+			// 任一不符合都按损坏归档处理。第四条规则——追加部分逐项等于各
 			// 直接上游恢复后的总和——需要全部记录恢复完毕才能核对，
 			// 在排序后的第二趟扫描中执行。
 			var invalidReason string
-			switch {
-			case !archiveIntact(j):
+			if dupID, dup := duplicateDependency(j); dup {
+				invalidReason = duplicateDependencyReason(dupID)
+			} else if !archiveIntact(j) {
 				invalidReason = "归档不完整或校验值不一致，成功结果不可用"
-			case !effectiveInputsCorrespond(j):
+			} else if !effectiveInputsCorrespond(j) {
 				invalidReason = "实际输入与原始参数或依赖数量不符，成功结果不可用"
-			case !archiveResultsValid(j):
+			} else if !archiveResultsValid(j) {
 				invalidReason = "归档数值结果与有效输入按计算规则应得的结果不符，成功结果不可用"
 			}
 			if invalidReason != "" {
@@ -383,8 +394,13 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	// 只有本作业自身归档有误（上游全部有效、仅保存的追加输入不符）时
 	// BlockerID 才保持 0。
 	//   - 带依赖的成功记录：追加部分与上游恢复后的结果逐项核对；
-	//   - 排队记录：按保存的依赖顺序选取最靠前的不可用上游（已失败/取消，
-	//     或记录缺失），立即级联失败，不再等待。
+	//   - 排队记录：先检查依赖列表自身是否重复引用同一作业号（本作业自身有误，
+	//     BlockerID 为 0），再按保存的依赖顺序选取最靠前的不可用上游（已
+	//     失败/取消，或记录缺失），立即级联失败，不再等待。
+	//
+	// 依赖列表重复属于记录自身问题，先于一切上游可用性判断：即使被重复引用的
+	// 上游仍在排队，重复记录也要立即失败，而等待该重复记录结果的下游则按既有
+	// 规则把它当作失败上游级联，根因就是该重复记录自身。
 	byID := make(map[uint64]*storedJob, len(jobs))
 	for _, j := range jobs {
 		byID[j.id] = j
@@ -412,6 +428,14 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 				failRestoredJob(dir, j, detail, 0)
 			}
 		case StatusQueued:
+			// 排队记录的依赖列表同样不能重复引用同一作业号：这属于本作业记录
+			// 自身有误，在选取不可用上游之前直接判失败——不能开始计算，也不能
+			// 把同一上游总和追加两次后继续。BlockerID 保持 0，不把被重复引用
+			// 且原本有效的上游改成失败。
+			if dupID, dup := duplicateDependency(j); dup {
+				failRestoredJob(dir, j, duplicateDependencyReason(dupID), 0)
+				continue
+			}
 			// 按保存的依赖顺序选取最靠前的不可用上游；其他上游作业号更小
 			// 或失败原因不同都不能改变这个选择。
 			directID, direct, blocked := pickBlockingUpstream(j, byID, restoredQueuedUpstreamBlocked)
@@ -432,10 +456,12 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 }
 
 // failRestoredJob 收拢重新打开归档时把恢复出的作业改判为失败的统一处理，
-// 供三类恢复失败共用（调用顺序即各类判定的既有先后）：
+// 供四类恢复失败共用（调用顺序即各类判定的既有先后）：
 //   - 上次关闭时仍在运行的作业：计算被中断（第一趟记录扫描）；
-//   - 原标为成功、但归档完整性、实际输入对应关系或数值结果不符规则的作业：
-//     本作业自身归档校验失败（第一趟记录扫描，BlockerID 恒为 0）；
+//   - 原标为成功、但归档完整性、依赖列表唯一性、实际输入对应关系或数值结果
+//     不符规则的作业：本作业自身归档校验失败（第一趟记录扫描，BlockerID 恒 0）；
+//   - 排队记录的依赖列表重复引用同一作业号：本作业记录自身有误（第二趟升序
+//     扫描，BlockerID 恒 0，先于上游可用性判断）；
 //   - 被不可用直接上游阻断的作业：成功记录复核与排队记录复查（第二趟升序扫描），
 //     BlockerID 由调用方按 blocker.go 的归因规则给出。
 //

@@ -31,6 +31,10 @@ import "fmt"
 // 本作业自身归档错误（BlockerID 保持 0），由 firstAppendedMismatch 单独处理；
 // 该核对只在没有不可用上游时进行，因此“追加输入不符”与“上游不可用”同时出现
 // 时，仍归因给依赖顺序中最靠前的不可用上游。
+//
+// 依赖列表自身重复引用同一作业号（duplicateDependency）同样属于本作业记录自身
+// 有误，与上游是否有效、数值结果是否自洽无关，在任何上游可用性核对之前直接
+// 判失败，BlockerID 保持 0；被重复引用的有效上游不被改判。
 
 // upstreamBlocked 判断某直接上游在当前场景下是否阻断本作业。dep 为 nil 表示
 // 归档目录中缺少该作业号的记录（仅重开归档可能出现）；返回 false 表示暂不能
@@ -116,6 +120,35 @@ func blockedFailureReason(head string, dep *storedJob, directID, root uint64) st
 		reason += fmt.Sprintf("；阻断根因为作业 %d", root)
 	}
 	return reason
+}
+
+// duplicateDependency 按作业保存的依赖顺序找出第一个再次出现的上游作业号
+// （即该作业号第二次出现的位置；相邻重复与隔着其他上游的重复同样识别）。
+// 唯一性按作业号判断，与上游总和是否相同无关：两个不同上游都得到 3 时各
+// 引用一次并不重复。没有重复时 ok=false。
+//
+// 运行期间提交时的唯一性由 validateDependenciesLocked 强制；本函数只服务于
+// 重新打开归档：已保存记录的依赖列表可能绕过提交校验（旧版本写入或记录被
+// 改动），恢复时必须按与提交一致的规则拒绝重复引用。
+func duplicateDependency(j *storedJob) (id uint64, ok bool) {
+	seen := make(map[uint64]struct{}, len(j.dependencies))
+	for _, id := range j.dependencies {
+		if _, dup := seen[id]; dup {
+			return id, true
+		}
+		seen[id] = struct{}{}
+	}
+	return 0, false
+}
+
+// duplicateDependencyReason 构造“依赖列表重复”的失败原因：明确说明依赖列表
+// 重复引用，并指出首次再次出现的上游作业号。这属于本作业记录自身有误，
+// 与上游是否有效无关——即使被重复引用的上游恢复后仍成功，也不把它判成
+// 失败或归因给它，因此 BlockerID 保持 0。
+func duplicateDependencyReason(id uint64) string {
+	return fmt.Sprintf(
+		"依赖列表重复：直接上游作业 %d 在依赖列表中再次出现，同一作业不能重复引用，成功结果不可用",
+		id)
 }
 
 // firstAppendedMismatch 在全部直接上游都存在且有效时，按保存的依赖顺序逐项核对
