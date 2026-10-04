@@ -138,9 +138,19 @@ func (s *Store) Close() error {
 
 // Submit 接受一次作业提交。
 //
-// 空序列返回 [ErrEmptySequence]；引用不存在的依赖返回
-// [ErrDependencyNotFound]；同一提交人复用请求号但内容变化返回
-// [ErrIdempotencyConflict]（同时返回原作业视图）——这些拒绝都不产生记录。
+// 空序列返回 [ErrEmptySequence]；依赖列表结构不合法（单依赖与列表同时启用、
+// 含零或重复作业号）返回 [ErrInvalidDependency]——这些请求本身的格式错误先于
+// 幂等判定拒绝，即使复用已接受的请求号也不例外。
+//
+// 非空请求号命中同一提交人的已接受请求时，幂等判定先于“引用的上游必须存在”
+// 校验：内容（整数序列及次序、种子、有序依赖内容）完全一致时返回原作业的
+// 当前详情且不返回错误，即使其直接上游记录在重开归档后已缺失、原作业已因此
+// 被改判为失败；内容不一致返回 [ErrIdempotencyConflict]（同时返回原作业视图，
+// 仍引用缺失上游时在原因中一并指出），原记录保持原样。重复提交不创建新作业、
+// 不补建缺失上游、不重新排队失败作业、也不改写原始参数或失败记录。
+//
+// 未命中已接受请求的新请求（提交人不同、请求号不同或请求号为空）引用不存在
+// 的依赖时返回 [ErrDependencyNotFound]；上述拒绝都不产生记录，也不占用请求号。
 // 相同提交人+请求号+内容的重复提交（含并发重复）返回原作业及其当前状态。
 func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	s.mu.Lock()
@@ -151,7 +161,9 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	if len(req.Values) == 0 {
 		return nil, ErrEmptySequence
 	}
-	if err := s.validateDependenciesLocked(&req); err != nil {
+	// 先校验与上游存在性无关的列表结构（单依赖与列表互斥、零与重复作业号），
+	// 这类拒绝不依赖内存索引，对新请求与幂等重放一视同仁。
+	if err := s.validateDependencyShapeLocked(&req); err != nil {
 		return nil, err
 	}
 	deps := requestDeps(&req)
@@ -159,13 +171,25 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 		key := idemIdentity{req.Submitter, req.RequestID}
 		if origID, ok := s.idem[key]; ok {
 			orig := s.byID[origID]
+			// 幂等重放先于“引用的上游必须存在”的校验：重新打开归档后原作业
+			// 直接上游的记录可能已经缺失，原作业也因此被改判为失败并落盘。
+			// 只要本次提交的整数序列及次序、种子与有序依赖内容和已接受请求
+			// 完全一致（单依赖写法与只含同一作业号的列表等价），就返回原作业
+			// 的当前详情——不重建缺失上游、不重新排队、不补算、不改写记录。
 			if sameContent(orig, &req) {
 				return s.viewLocked(orig), nil
 			}
 			return s.viewLocked(orig),
-				fmt.Errorf("%w：提交人 %q 的请求号 %q 已用于作业 %d",
-					ErrIdempotencyConflict, req.Submitter, req.RequestID, origID)
+				fmt.Errorf("%w：提交人 %q 的请求号 %q 已用于作业 %d，且本次内容与原请求不一致%s，原记录保持原样",
+					ErrIdempotencyConflict, req.Submitter, req.RequestID, origID,
+					s.missingDependencyNoteLocked(deps))
 		}
+	}
+	// 新请求（请求号为空，或该提交人首次使用此请求号）仍要求每个直接上游
+	// 都存在；引用不存在上游的提交被拒绝，不产生记录，也不占用请求号。
+	// 此检查必须位于幂等判定之后：上面的重放/冲突分支可能引用缺失的上游。
+	if err := s.validateDependenciesExistLocked(deps); err != nil {
+		return nil, err
 	}
 
 	now := s.now().UTC()
@@ -197,7 +221,8 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 
 // requestDeps 规范化一次提交的直接上游作业号列表：
 // 非空 Dependencies 优先（保持次序）；否则单依赖方式退化为只含一个作业号的列表；
-// 两者皆无则为 nil。调用前须先经 [Store.validateDependenciesLocked] 校验。
+// 两者皆无则为 nil。调用前须先经 [Store.validateDependencyShapeLocked] 与
+// （新请求路径上的）[Store.validateDependenciesExistLocked] 校验。
 func requestDeps(req *SubmitRequest) []uint64 {
 	if len(req.Dependencies) > 0 {
 		return append([]uint64(nil), req.Dependencies...)
@@ -208,13 +233,15 @@ func requestDeps(req *SubmitRequest) []uint64 {
 	return nil
 }
 
-// validateDependenciesLocked 在持锁状态下校验提交的依赖列表：
+// validateDependencyShapeLocked 在持锁状态下校验提交依赖列表中与上游存在性
+// 无关的结构问题：
 //   - 单依赖方式与非空列表同时启用 → 拒绝；
-//   - 列表含零或重复作业号 → 拒绝（错误指出具体作业号）；
-//   - 列表引用提交时不存在的作业 → 拒绝。
+//   - 列表含零或重复作业号 → 拒绝（错误指出具体作业号）。
 //
-// 任一拒绝都不产生记录，也不占用幂等请求号。
-func (s *Store) validateDependenciesLocked(req *SubmitRequest) error {
+// 该校验先于幂等判定执行：空整数序列、依赖号为零、重复依赖与两种写法
+// 同时启用都属于请求本身的格式错误，即使提交人+请求号与已接受请求相同
+// 也仍返回原有的对应拒绝。
+func (s *Store) validateDependencyShapeLocked(req *SubmitRequest) error {
 	if req.HasDependency && len(req.Dependencies) > 0 {
 		return fmt.Errorf("%w：单依赖方式与依赖列表不能同时启用", ErrInvalidDependency)
 	}
@@ -229,12 +256,33 @@ func (s *Store) validateDependenciesLocked(req *SubmitRequest) error {
 		}
 		seen[id] = struct{}{}
 	}
+	return nil
+}
+
+// validateDependenciesExistLocked 校验规范化后的依赖列表只引用当前归档中
+// 存在的作业。仅适用于幂等判定之后的新请求：已接受请求的重放（或内容
+// 冲突）即使引用了重开后缺失的上游，也要返回原作业而不是被这里拒绝。
+//
+// 任一拒绝都不产生记录，也不占用幂等请求号。
+func (s *Store) validateDependenciesExistLocked(deps []uint64) error {
 	for _, id := range deps {
 		if s.byID[id] == nil {
 			return fmt.Errorf("%w：作业号 %d", ErrDependencyNotFound, id)
 		}
 	}
 	return nil
+}
+
+// missingDependencyNoteLocked 在幂等冲突时补充说明：若本次（与原请求内容
+// 不一致的）提交仍引用已经缺失的上游，明确指出缺失的作业号，使冲突原因
+// 不会被误读成仅仅是上游不存在。
+func (s *Store) missingDependencyNoteLocked(deps []uint64) string {
+	for _, id := range deps {
+		if s.byID[id] == nil {
+			return fmt.Sprintf("；本次引用的直接上游作业 %d 记录已缺失", id)
+		}
+	}
+	return ""
 }
 
 // sameContent 判断两次提交的内容是否一致；整数次序或依赖列表（内容与次序）

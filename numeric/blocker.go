@@ -133,7 +133,7 @@ func blockedFailureReason(head string, dep *storedJob, directID, root uint64) st
 // 唯一性按作业号判断，与上游总和是否相同无关：两个不同上游都得到 3 时各
 // 引用一次并不重复。没有重复时 ok=false。
 //
-// 运行期间提交时的唯一性由 validateDependenciesLocked 强制；本函数只服务于
+// 运行期间提交时的唯一性由 validateDependencyShapeLocked 强制；本函数只服务于
 // 重新打开归档：已保存记录的依赖列表可能绕过提交校验（旧版本写入或记录被
 // 改动），恢复时必须按与提交一致的规则拒绝重复引用。
 func duplicateDependency(j *storedJob) (id uint64, ok bool) {
@@ -164,8 +164,9 @@ func duplicateDependencyReason(id uint64) string {
 // 每个作业号与本作业号的大小。没有违反时 ok=false。
 //
 // 与上游是否存在、是否成功无关：即使被引用的作业确实存在且已经成功，也不能
-// 接受这种依赖。运行期间提交时由 validateDependenciesLocked 与“只能引用已存在
-// 作业”的校验共同强制；本函数只服务于重新打开归档：已保存记录可能绕过提交
+// 接受这种依赖。运行期间提交时由 validateDependencyShapeLocked 与
+// validateDependenciesExistLocked（只能引用已存在作业，作业号又按接受先后递增）
+// 共同强制；本函数只服务于重新打开归档：已保存记录可能绕过提交
 // 校验（旧版本写入或记录被改动），恢复时必须按与提交一致的规则改判失败。
 // 这属于本作业记录自身有误，BlockerID 保持 0，不把被引用的有效作业判成失败。
 func firstIllegalOrderingDependency(j *storedJob) (id uint64, ok bool) {
