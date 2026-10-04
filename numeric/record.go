@@ -252,6 +252,10 @@ func syncDir(dir string) {
 //     BlockerID 沿链条保留最初的根因（与运行中依赖失败同一规则）；
 //     仅追加输入对不上而上游全部有效的属于本作业自身归档有误，BlockerID
 //     保持 0。仍在排队的作业在同一趟升序扫描中按既有依赖规则级联失败。
+//   - 保存的依赖列表重复引用同一作业号（不论相邻或隔着其他上游）时，
+//     原排队或成功的作业一律改判为失败：与提交时的唯一性要求一致，不因
+//     数值结果自洽而接受重复引用；属于本作业记录自身有误，BlockerID
+//     保持 0，失败原因指出首次再次出现的上游作业号。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -391,6 +395,17 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	}
 	for _, j := range jobs {
 		if len(j.dependencies) == 0 {
+			continue
+		}
+		// 保存的依赖列表重复引用同一作业号：提交时不允许同一份作业重复引用
+		// 同一个直接上游，恢复时同样不接受——即使实际输入、数值结果、日志、
+		// 摘要与校验值全套自洽。这属于本作业记录自身有误（BlockerID 保持 0），
+		// 被重复引用且原本有效的上游保留自己的结果；原排队的作业不再开始
+		// 计算（不会把同一份上游总和追加两次），原成功的作业不再返回归档与
+		// 实际输入。已失败/取消的记录保留既有终态与原因，不在此改写。
+		if dupID, dup := duplicateDependency(j.dependencies); dup &&
+			(j.status == StatusQueued || j.status == StatusSucceeded) {
+			failRestoredJob(dir, j, duplicateDependencyReason(dupID), 0)
 			continue
 		}
 		switch j.status {
