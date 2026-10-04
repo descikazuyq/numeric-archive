@@ -257,10 +257,14 @@ func TestReopenInvalidatedUpstreamFailsSucceededDependents(t *testing.T) {
 	// 已成功归档的 mid/down 也不能继续使用失效上游。
 	assertDependencyInputsFailure(t, s2, midBefore, up.ID, "无法使用")
 	assertDependencyInputsFailure(t, s2, downBefore, mid.ID, "无法使用")
-	// 排队等待失效作业的下游按既有依赖失败处理。
+	// 排队等待失效作业的下游按既有依赖失败处理：直接阻断者是 mid，但根因
+	// 作业号必须沿链条保留为最初失效的 up，不能把中间作业 mid 记成根因。
 	gq := waitStatus(t, s2, 100, StatusFailed)
-	if gq.BlockerID != mid.ID || !strings.Contains(gq.FailureReason, "作业 "+itoa(mid.ID)) {
-		t.Fatalf("queued downstream must cascade: blocker=%d reason=%q", gq.BlockerID, gq.FailureReason)
+	if gq.BlockerID != up.ID ||
+		!strings.Contains(gq.FailureReason, "作业 "+itoa(mid.ID)) ||
+		!strings.Contains(gq.FailureReason, "根因为作业 "+itoa(up.ID)) {
+		t.Fatalf("queued downstream must cascade with root %d via direct %d: blocker=%d reason=%q",
+			up.ID, mid.ID, gq.BlockerID, gq.FailureReason)
 	}
 }
 

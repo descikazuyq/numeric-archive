@@ -248,7 +248,11 @@ func syncDir(dir string) {
 //     fail-closed 地标记为失败，维持“成功必有完整归档”的不变量；
 //   - 有依赖的成功记录还要求每个直接上游都存在、恢复后仍是带完整归档的
 //     成功状态，且实际输入的追加部分逐项等于这些上游按保存的依赖顺序
-//     排列的总和；对不上或上游不可用的同样改判为失败。
+//     排列的总和；对不上或上游不可用的同样改判为失败。因直接上游不可用
+//     而失败时，BlockerID 与正常运行中的依赖失败遵守同一项规则：失败原因
+//     指出直接上游，BlockerID 则沿链条保留最初使结果不可用的根因作业号
+//     （直接上游记录缺失时以该缺失作业号为根因）；只有全部上游有效、仅
+//     追加值对不上时才是本作业自身归档有误，BlockerID 保持 0。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -392,7 +396,7 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	// 第二趟校验：有依赖的成功记录，其实际输入的追加部分必须与直接上游
 	// 恢复后的结果逐项对应。上游作业号必然更小，按升序单趟扫描即可让
 	// “上游本次被改判失败”沿成功链条传播到更下游——下游看到的一定是
-	// 上游已经确定的最终状态。
+	// 上游已经确定的最终状态（含其阻断根因）。
 	byID := make(map[uint64]*storedJob, len(jobs))
 	for _, j := range jobs {
 		byID[j.id] = j
@@ -401,18 +405,22 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		if j.status != StatusSucceeded || len(j.dependencies) == 0 {
 			continue
 		}
-		reason := dependencyInputsFailure(j, byID)
+		reason, blocker := dependencyInputsFailure(j, byID)
 		if reason == "" {
 			continue
 		}
 		j.status = StatusFailed
 		j.failureReason = reason
+		// 因直接上游不可用而失败时，BlockerID 沿链条保留最初的根因，
+		// 与运行中依赖失败遵守同一项规则；只是本作业自身追加值对不上
+		// （上游全部有效）时属于本作业归档有误，BlockerID 保持 0。
+		j.blockerID = blocker
 		if j.finishedAt.IsZero() {
 			j.finishedAt = time.Now().UTC()
 		}
 		j.effectiveValues = nil
 		j.archive = nil
-		// 可正常写入时，保存的记录同样改写为失败。
+		// 可正常写入时，保存的记录同样改写为失败（含相同根因）。
 		if data, err := encodeRecord(j); err == nil {
 			_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
 		}
@@ -427,22 +435,53 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 //   - 追加部分逐项等于这些上游按保存的依赖顺序排列的总和。负数、零以及
 //     不同上游恰好同和都按位置判断，不要求上游总和互不相同。
 //
-// 返回空串表示对应关系成立；否则返回指出具体直接上游作业号、并说明成功
-// 结果不可用的失败原因。只读上游状态，绝不因下游追加值错误改动上游。
+// 按保存的依赖顺序选取最靠前的不可用上游（缺失，或恢复后未保持带完整归档
+// 的成功状态）作为直接阻断者，再沿该上游已有的阻断信息确定根因：上游记录了
+// BlockerID 时沿用它，否则以上游自身为根因；直接上游记录缺失时以这个缺失的
+// 作业号作为根因。只有当全部上游归档都有效、只是追加值对不上时，才属于本
+// 作业自身归档有误，此时返回根因 0——不能把有效上游判成失败或归因给它。
+//
+// 返回空串表示对应关系成立；否则返回指出具体直接上游作业号、说明成功结果
+// 不可用，并在直接上游与根因不同时同时说明根因作业号的失败原因。只读
+// 上游状态，绝不因下游追加值错误改动上游。
 //
 // 调用前须已通过 effectiveInputsCorrespond（保证追加部分长度恰为依赖数量）。
-func dependencyInputsFailure(j *storedJob, byID map[uint64]*storedJob) string {
+func dependencyInputsFailure(j *storedJob, byID map[uint64]*storedJob) (reason string, blocker uint64) {
+	// 先按保存的依赖顺序找最靠前的不可用上游。只要存在不可用上游，本作业
+	// 的成功结果就因它而不可用，根因沿该上游已有的阻断信息保留——与正常
+	// 运行中的依赖失败遵守同一项规则，不能在每经过一个已归档的中间作业时
+	// 重新起算。
+	for _, id := range j.dependencies {
+		dep := byID[id]
+		if dep == nil || dep.status != StatusSucceeded || dep.archive == nil {
+			root := blockerRoot(dep, id)
+			r := fmt.Sprintf("直接上游作业 %d 无法使用：不存在或恢复后未保持带完整归档的成功状态，成功结果不可用", id)
+			if root != id {
+				r += fmt.Sprintf("；阻断根因为作业 %d", root)
+			}
+			return r, root
+		}
+	}
+	// 上游归档全部有效：追加部分必须逐项等于各上游按保存顺序排列的总和。
+	// 对不上是本作业自身归档有误，BlockerID 保持 0。
 	n := len(j.values)
 	for i, id := range j.dependencies {
 		dep := byID[id]
-		if dep == nil || dep.status != StatusSucceeded || dep.archive == nil {
-			return fmt.Sprintf("直接上游作业 %d 无法使用：不存在或恢复后未保持带完整归档的成功状态，成功结果不可用", id)
-		}
 		if j.effectiveValues[n+i] != dep.archive.Sum {
-			return fmt.Sprintf("实际输入的追加部分与直接上游作业 %d 的总和无法对应（追加值须按保存的依赖顺序逐项等于各上游总和），成功结果不可用", id)
+			return fmt.Sprintf("实际输入的追加部分与直接上游作业 %d 的总和无法对应（追加值须按保存的依赖顺序逐项等于各上游总和），成功结果不可用", id), 0
 		}
 	}
-	return ""
+	return "", 0
+}
+
+// blockerRoot 沿直接上游已有的阻断信息确定根因作业号：上游记录了非 0 的
+// BlockerID 时沿用它（根因沿链条保留），否则以上游自身作业号为根因；
+// 上游记录缺失（dep 为 nil）时以这个缺失的作业号 id 作为根因。
+func blockerRoot(dep *storedJob, id uint64) uint64 {
+	if dep != nil && dep.blockerID != 0 {
+		return dep.blockerID
+	}
+	return id
 }
 
 // archiveIntact 复算成功归档的全部确定性字段，任何不一致都视为不可用。

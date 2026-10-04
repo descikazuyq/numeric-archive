@@ -364,37 +364,50 @@ func (s *Store) List(submitter string, start, end time.Time) ([]*Job, error) {
 	return out, nil
 }
 
-// cascadeLocked 把“直接上游已失败/取消”的排队作业标记为失败并递归传播。
+// cascadeLocked 把“直接上游已失败/取消（或记录缺失）”的排队作业标记为失败并
+// 递归传播。
 //
 // 上游在提交时必须已存在，因此上游作业号必然更小，按作业号升序单趟
 // 扫描即可让阻断沿链条传播到最下游。作业有多个直接上游时，按列表顺序
-// 选取最靠前的已失败/取消者作为直接阻断者；作业一旦失败，其原因不再被
-// 后来发生的上游状态变化改写。
+// 选取最靠前的不可用上游（已失败/取消，或归档中缺少其记录）作为直接
+// 阻断者；根因则沿该上游已有的阻断信息保留（[blockerRoot]），直接上游
+// 记录缺失时以缺失的作业号作为根因。作业一旦失败，其原因不再被后来发生
+// 的上游状态变化改写。
 func (s *Store) cascadeLocked() {
 	for _, j := range s.jobs {
 		if j.status != StatusQueued || len(j.dependencies) == 0 {
 			continue
 		}
-		var direct *storedJob
+		// 按保存的依赖顺序找最靠前的不可用上游。
+		var reason string
+		var root uint64
+		blocked := false
 		for _, id := range j.dependencies {
 			dep := s.byID[id]
 			if dep == nil {
-				continue
+				reason = missingUpstreamBlockedReason(id)
+				root = id
+				blocked = true
+				break
 			}
 			if dep.status == StatusFailed || dep.status == StatusCanceled {
-				direct = dep
+				root = blockerRoot(dep, dep.id)
+				reason = blockedReason(dep, root)
+				blocked = true
 				break
 			}
 		}
-		if direct == nil {
+		if !blocked {
 			continue
 		}
-		root := direct.blockerID
-		if root == 0 {
-			root = direct.id
-		}
-		s.markFailedLocked(j, blockedReason(direct, root), root)
+		s.markFailedLocked(j, reason, root)
 	}
+}
+
+// missingUpstreamBlockedReason 说明排队作业被一个记录缺失的直接上游阻断：
+// 以该缺失作业号为根因，并明确说明其结果无法使用。
+func missingUpstreamBlockedReason(id uint64) string {
+	return fmt.Sprintf("直接上游作业 %d 无法使用：归档中缺少该作业的记录，其成功结果不可用，阻断本作业继续计算", id)
 }
 
 func blockedReason(dep *storedJob, root uint64) string {
