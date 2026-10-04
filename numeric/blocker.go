@@ -35,6 +35,12 @@ import "fmt"
 // 依赖列表自身重复引用同一作业号（duplicateDependency）同样属于本作业记录自身
 // 有误，与上游是否有效、数值结果是否自洽无关，在任何上游可用性核对之前直接
 // 判失败，BlockerID 保持 0；被重复引用的有效上游不被改判。
+//
+// 依赖先后关系（firstIllegalOrderingDependency）也是记录自身问题：直接上游作业号
+// 必须严格小于本作业号（正常提交只能引用已存在的作业，作业号又按接受先后递增），
+// 引用自己或后来作业的记录即使数值全套自洽、被引用作业确实存在且成功，恢复时也
+// 一律改判失败，BlockerID 保持 0。已因重复依赖判失败的记录保留现有重复失败说明，
+// 不被本检查改写（重复检查先行）。
 
 // upstreamBlocked 判断某直接上游在当前场景下是否阻断本作业。dep 为 nil 表示
 // 归档目录中缺少该作业号的记录（仅重开归档可能出现）；返回 false 表示暂不能
@@ -149,6 +155,36 @@ func duplicateDependencyReason(id uint64) string {
 	return fmt.Sprintf(
 		"依赖列表重复：直接上游作业 %d 在依赖列表中再次出现，同一作业不能重复引用，成功结果不可用",
 		id)
+}
+
+// firstIllegalOrderingDependency 按作业保存的依赖顺序找出第一个违反先后关系
+// 的直接上游作业号：正常提交只能引用已经存在的作业，而作业号按接受先后递增，
+// 因此直接上游作业号必须严格小于本作业号；引用自己（等于）或引用后来作业
+// （大于）都不合法。不比较提交时间，也不要求依赖列表按作业号排序——只判断
+// 每个作业号与本作业号的大小。没有违反时 ok=false。
+//
+// 与上游是否存在、是否成功无关：即使被引用的作业确实存在且已经成功，也不能
+// 接受这种依赖。运行期间提交时由 validateDependenciesLocked 与“只能引用已存在
+// 作业”的校验共同强制；本函数只服务于重新打开归档：已保存记录可能绕过提交
+// 校验（旧版本写入或记录被改动），恢复时必须按与提交一致的规则改判失败。
+// 这属于本作业记录自身有误，BlockerID 保持 0，不把被引用的有效作业判成失败。
+func firstIllegalOrderingDependency(j *storedJob) (id uint64, ok bool) {
+	for _, id := range j.dependencies {
+		if id >= j.id {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+// illegalOrderingDependencyReason 构造“依赖先后关系不合法”的失败原因：指出
+// 保存的依赖顺序中第一个不合法的上游作业号，并说明它不能作为本作业的上游。
+// BlockerID 保持 0——这是本作业记录自身有误，即使被引用的作业存在且成功也不
+// 把它判成失败或归因给它。
+func illegalOrderingDependencyReason(id, selfID uint64) string {
+	return fmt.Sprintf(
+		"依赖先后关系不合法：保存的依赖顺序中作业 %d 是第一个作业号不小于本作业 %d 的直接上游，作业号按接受先后递增，它不能作为本作业的上游，成功结果不可用",
+		id, selfID)
 }
 
 // firstAppendedMismatch 在全部直接上游都存在且有效时，按保存的依赖顺序逐项核对
