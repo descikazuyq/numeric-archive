@@ -12,7 +12,9 @@ import (
 // 状态失败、查询与列举不再返回成功归档与实际输入，原作业号、提交人、
 // 请求号、原始序列、种子与依赖顺序保留，失败原因指出无法对应或无法
 // 使用的直接上游作业号并说明成功结果不可用，落盘记录同样已改写为失败。
-func assertDependencyInputsFailure(t *testing.T, s *Store, j *Job, wantDep uint64, keyword string) {
+// wantBlocker 为必须保留的阻断根因作业号：因直接上游结果失效时沿链条
+// 保留最初根因；仅本作业保存的追加输入不符（上游全部有效）时必须为 0。
+func assertDependencyInputsFailure(t *testing.T, s *Store, j *Job, wantDep uint64, keyword string, wantBlocker uint64) {
 	t.Helper()
 	g, err := s.Get(j.ID)
 	if err != nil {
@@ -20,6 +22,9 @@ func assertDependencyInputsFailure(t *testing.T, s *Store, j *Job, wantDep uint6
 	}
 	if g.Status != StatusFailed {
 		t.Fatalf("job %d must fail closed, got %s", j.ID, g.Status)
+	}
+	if g.BlockerID != wantBlocker {
+		t.Fatalf("job %d blocker=%d want root %d (reason=%q)", j.ID, g.BlockerID, wantBlocker, g.FailureReason)
 	}
 	if g.Archive != nil || g.EffectiveValues != nil {
 		t.Fatalf("job %d must not carry archive/effective inputs: archive=%v effective=%v",
@@ -114,7 +119,7 @@ func TestReopenRejectsSwappedDependencySums(t *testing.T) {
 	}
 	defer s2.Close()
 	// 第一个对不上的位置对应依赖列表中的 u2。
-	assertDependencyInputsFailure(t, s2, before, u2.ID, "无法对应")
+	assertDependencyInputsFailure(t, s2, before, u2.ID, "无法对应", 0)
 
 	// 上游自身通过校验，不因下游追加值错误而改动。
 	for _, id := range []uint64{u1.ID, u2.ID} {
@@ -182,7 +187,7 @@ func TestReopenDependencyAppendedInputsByPosition(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sBad.Close()
-	assertDependencyInputsFailure(t, sBad, before, u4.ID, "无法对应")
+	assertDependencyInputsFailure(t, sBad, before, u4.ID, "无法对应", 0)
 
 	// 原始归档重开：同和上游、零和、负和都按位置对应，结果与校验值不变。
 	s2, err := Open(dir)
@@ -255,12 +260,18 @@ func TestReopenInvalidatedUpstreamFailsSucceededDependents(t *testing.T) {
 		t.Fatalf("forged upstream: %s, want failed", gUp.Status)
 	}
 	// 已成功归档的 mid/down 也不能继续使用失效上游。
-	assertDependencyInputsFailure(t, s2, midBefore, up.ID, "无法使用")
-	assertDependencyInputsFailure(t, s2, downBefore, mid.ID, "无法使用")
-	// 排队等待失效作业的下游按既有依赖失败处理。
+	assertDependencyInputsFailure(t, s2, midBefore, up.ID, "无法使用", up.ID)
+	assertDependencyInputsFailure(t, s2, downBefore, mid.ID, "无法使用", up.ID)
+	// 排队等待失效作业的下游按既有依赖失败处理：直接上游为 mid，根因沿
+	// 链条保留为最初校验失败的 up。
 	gq := waitStatus(t, s2, 100, StatusFailed)
-	if gq.BlockerID != mid.ID || !strings.Contains(gq.FailureReason, "作业 "+itoa(mid.ID)) {
-		t.Fatalf("queued downstream must cascade: blocker=%d reason=%q", gq.BlockerID, gq.FailureReason)
+	if gq.BlockerID != up.ID {
+		t.Fatalf("queued downstream blocker=%d want root %d", gq.BlockerID, up.ID)
+	}
+	if !strings.Contains(gq.FailureReason, "直接上游作业 "+itoa(mid.ID)) ||
+		!strings.Contains(gq.FailureReason, "阻断根因为作业 "+itoa(up.ID)) {
+		t.Fatalf("queued downstream must name direct upstream %d and root %d: %q",
+			mid.ID, up.ID, gq.FailureReason)
 	}
 }
 
@@ -291,7 +302,7 @@ func TestReopenMissingUpstreamRecordFailsDependent(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s2.Close()
-	assertDependencyInputsFailure(t, s2, before, up.ID, "无法使用")
+	assertDependencyInputsFailure(t, s2, before, up.ID, "无法使用", up.ID)
 }
 
 // 旧格式单依赖记录（无 dependencies 字段）按同一含义核对追加值：
