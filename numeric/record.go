@@ -245,7 +245,10 @@ func syncDir(dir string) {
 //   - 上次关闭时仍为 running 的作业标记为失败，原因是计算被中断；
 //   - 成功记录缺少归档、校验值对不上，实际输入与原始参数或直接依赖数量
 //     不对应，或归档数值结果与有效输入按计算规则应得的结果不符时，
-//     fail-closed 地标记为失败，维持“成功必有完整归档”的不变量。
+//     fail-closed 地标记为失败，维持“成功必有完整归档”的不变量；
+//   - 有依赖的成功记录还要求每个直接上游都存在、恢复后仍是成功状态且
+//     带有通过校验的完整归档，并且实际输入的追加部分逐项等于这些上游的
+//     总和、位置严格对应保存的依赖顺序；不满足时同样改判为失败。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -384,7 +387,74 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	sort.Slice(jobs, func(a, b int) bool {
 		return jobs[a].id < jobs[b].id
 	})
+	// 第二趟：有依赖的成功记录还须满足追加部分与直接上游的对应关系——
+	// 每个直接上游都存在、恢复后仍是成功状态且有通过校验的完整归档，
+	// 实际输入的追加部分逐项等于这些上游的总和，位置严格对应保存的
+	// 依赖顺序。上游作业号必然更小，按升序单趟处理即可让本次打开中
+	// 被改判失败的上游使其成功下游在同一趟里连锁失败（仍在排队的
+	// 下游则由 Open 的 cascadeLocked 按既有依赖失败处理）。
+	byID := make(map[uint64]*storedJob, len(jobs))
+	for _, j := range jobs {
+		byID[j.id] = j
+	}
+	for _, j := range jobs {
+		if j.status != StatusSucceeded || len(j.dependencies) == 0 {
+			continue
+		}
+		bad := mismatchedDependencyInputs(j, byID)
+		if len(bad) == 0 {
+			continue
+		}
+		j.status = StatusFailed
+		j.failureReason = fmt.Sprintf(
+			"实际输入的追加部分与直接上游作业 %s 不对应（上游缺失、未成功恢复或其总和与追加值按依赖顺序不符），成功结果不可用",
+			joinJobIDs(bad))
+		if j.finishedAt.IsZero() {
+			j.finishedAt = time.Now().UTC()
+		}
+		j.effectiveValues = nil
+		j.archive = nil
+		if data, err := encodeRecord(j); err == nil {
+			_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
+		}
+	}
 	return jobs, maxID, nil
+}
+
+// joinJobIDs 把作业号列表格式化为 “2、3” 形式，用于失败原因。
+func joinJobIDs(ids []uint64) string {
+	var b strings.Builder
+	for i, id := range ids {
+		if i > 0 {
+			b.WriteString("、")
+		}
+		fmt.Fprintf(&b, "%d", id)
+	}
+	return b.String()
+}
+
+// mismatchedDependencyInputs 返回无法对应或无法使用的直接上游作业号
+// （保持依赖列表中的顺序）：上游不存在、恢复后不是成功状态或没有完整
+// 归档，以及实际输入的追加部分在该上游对应的位置上不等于其归档总和。
+// 位置严格对应保存的依赖顺序——负数、零与总和恰好相同的不同上游都按
+// 位置判断，不要求上游总和互不相同。
+//
+// 调用前作业须已通过 effectiveInputsCorrespond（实际输入长度恰为原始
+// 长度加依赖数量，原始部分逐项对应），因此 n+i 下标必然有效。
+func mismatchedDependencyInputs(j *storedJob, byID map[uint64]*storedJob) []uint64 {
+	n := len(j.values)
+	var bad []uint64
+	for i, id := range j.dependencies {
+		dep := byID[id]
+		if dep == nil || dep.status != StatusSucceeded || dep.archive == nil {
+			bad = append(bad, id)
+			continue
+		}
+		if j.effectiveValues[n+i] != dep.archive.Sum {
+			bad = append(bad, id)
+		}
+	}
+	return bad
 }
 
 // archiveIntact 复算成功归档的全部确定性字段，任何不一致都视为不可用。
