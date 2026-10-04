@@ -367,49 +367,28 @@ func (s *Store) List(submitter string, start, end time.Time) ([]*Job, error) {
 // cascadeLocked 把“直接上游已失败/取消”的排队作业标记为失败并递归传播。
 //
 // 上游在提交时必须已存在，因此上游作业号必然更小，按作业号升序单趟
-// 扫描即可让阻断沿链条传播到最下游。作业有多个直接上游时，按列表顺序
-// 选取最靠前的已失败/取消者作为直接阻断者；作业一旦失败，其原因不再被
-// 后来发生的上游状态变化改写。
+// 扫描即可让阻断沿链条传播到最下游。直接上游的选取与根因的确定与
+// 重开归档时的依赖检查共用同一套规则（见 dependency.go）；作业一旦
+// 失败，其原因不再被后来发生的上游状态变化改写。
 func (s *Store) cascadeLocked() {
 	for _, j := range s.jobs {
 		if j.status != StatusQueued || len(j.dependencies) == 0 {
 			continue
 		}
-		var direct *storedJob
-		for _, id := range j.dependencies {
-			dep := s.byID[id]
-			if dep == nil {
-				continue
-			}
-			if dep.status == StatusFailed || dep.status == StatusCanceled {
-				direct = dep
-				break
-			}
-		}
-		if direct == nil {
+		depID, direct, missing := firstUnavailableDep(j.dependencies, s.byID, depBlocked)
+		if depID == 0 {
 			continue
 		}
-		root := direct.blockerID
-		if root == 0 {
-			root = direct.id
+		if missing {
+			// 运行期间直接上游记录必然存在（提交时校验存在性且记录从不
+			// 删除），此分支不可达；保留它使运行期与重开归档走同一条
+			// 选取与归因路径。
+			s.markFailedLocked(j, missingDepBlockedReason(depID), depID)
+			continue
 		}
+		root := blockerRootOf(direct)
 		s.markFailedLocked(j, blockedReason(direct, root), root)
 	}
-}
-
-func blockedReason(dep *storedJob, root uint64) string {
-	state := "失败"
-	if dep.status == StatusCanceled {
-		state = "被取消"
-	}
-	reason := fmt.Sprintf("直接上游作业 %d 已%s，阻断本作业继续计算", dep.id, state)
-	if dep.status == StatusFailed && dep.failureReason != "" {
-		reason += "（其失败原因：" + dep.failureReason + "）"
-	}
-	if root != dep.id {
-		reason += fmt.Sprintf("；阻断根因为作业 %d", root)
-	}
-	return reason
 }
 
 // pickRunnableLocked 返回提交顺序上第一个可运行的排队作业。
