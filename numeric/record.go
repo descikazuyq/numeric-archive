@@ -431,125 +431,40 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		}
 		switch j.status {
 		case StatusSucceeded:
-			depID, unavailable, detail := dependencyInputsCheck(j, byID)
-			if detail == "" {
+			// 第一趟：按保存的依赖顺序找最靠前的不可用上游（记录缺失或恢复后
+			// 未保持带完整归档的成功状态）。
+			directID, dep, unavailable := pickBlockingUpstream(j, byID, restoredArchiveUpstreamBlocked)
+			if unavailable {
+				// 因直接上游结果失效而失败：根因沿该上游已有的阻断信息保留，
+				// 直接上游记录缺失时以缺失的作业号本身作为根因。
+				root := blockerRoot(dep, directID)
+				failRestored(j, blockedFailureReason(restoredArchiveHead(directID), dep, directID, root), root)
 				continue
 			}
-			if !unavailable {
-				// 直接上游全部存在且有效，只是本作业保存的追加输入与上游
-				// 总和不符：属于本作业自身归档有误，不把有效上游判成失败
-				// 或归因给它。
+			// 第二趟：直接上游全部存在且有效，只是本作业保存的追加输入与上游
+			// 总和按位置对不上——属于本作业自身归档有误，不把有效上游判成
+			// 失败或归因给它，BlockerID 保持 0。
+			if _, detail, mismatch := firstAppendedMismatch(j, byID); mismatch {
 				failRestored(j, detail, 0)
-				continue
 			}
-			// 因直接上游结果失效而失败：沿该上游已有的阻断信息保留根因；
-			// 直接上游记录缺失时以缺失的作业号本身作为根因。
-			dep := byID[depID]
-			root := depID
-			if dep != nil && dep.blockerID != 0 {
-				root = dep.blockerID
-			}
-			failRestored(j, restoredBlockedReason(dep, depID, root, detail), root)
 		case StatusQueued:
 			// 按保存的依赖顺序选取最靠前的不可用上游；其他上游作业号更小
 			// 或失败原因不同都不能改变这个选择。
-			var directID uint64
-			var direct *storedJob
-			missing := false
-			for _, id := range j.dependencies {
-				dep := byID[id]
-				switch {
-				case dep == nil:
-					directID, direct, missing = id, nil, true
-				case dep.status == StatusFailed || dep.status == StatusCanceled:
-					directID, direct, missing = id, dep, false
-				default:
-					continue
-				}
-				break
-			}
-			if directID == 0 {
+			directID, direct, blocked := pickBlockingUpstream(j, byID, restoredQueuedUpstreamBlocked)
+			if !blocked {
 				continue // 上游仍在排队等情况：继续等待，不挡住其他作业。
 			}
-			if missing {
+			root := blockerRoot(direct, directID)
+			if direct == nil {
 				// 直接上游的记录在归档目录中缺失，其结果不可能再变为可用：
 				// 以缺失的作业号作为根因，并明确说明结果无法使用。
-				root := directID
-				reason := fmt.Sprintf(
-					"直接上游作业 %d 无法使用：归档目录中缺少该作业的记录，其结果无法使用，阻断本作业继续计算",
-					directID)
-				failRestored(j, reason, root)
+				failRestored(j, blockedFailureReason(restoredMissingHead(directID), nil, directID, root), root)
 				continue
 			}
-			root := direct.blockerID
-			if root == 0 {
-				root = direct.id
-			}
-			failRestored(j, blockedReason(direct, root), root)
+			failRestored(j, blockedFailureReason(runtimeBlockedHead(direct), direct, directID, root), root)
 		}
 	}
 	return jobs, maxID, nil
-}
-
-// dependencyInputsCheck 核对有依赖的成功记录：实际输入的追加部分（原始
-// 序列之后的 len(dependencies) 个位置）必须与直接上游恢复后的结果对应——
-//   - 每个直接上游都必须存在、恢复后仍是成功状态且带有通过全部校验的完整
-//     归档；上游在本次打开中被其他校验改判失败的，本作业也不能继续使用它；
-//   - 追加部分逐项等于这些上游按保存的依赖顺序排列的总和。负数、零以及
-//     不同上游恰好同和都按位置判断，不要求上游总和互不相同。
-//
-// 多依赖作业按保存的依赖顺序选取最靠前的不可用上游，其他上游的作业号更小
-// 或失败原因不同都不能改变这个选择；注意“不可用”与“追加值不符”分两趟
-// 判断：只要依赖列表中存在不可用上游，就归因到其中最靠前的一个，即使更
-// 靠前的有效上游处恰好保存了错误的追加值——只有全部上游都有效时，追加值
-// 按位置对不上才属于本作业自身的归档错误。
-//
-// 返回：
-//   - upstreamUnavailable=true：选中的直接上游 depID 无法使用（记录缺失或
-//     恢复后未保持带完整归档的成功状态）。本作业的失败属于上游结果失效，
-//     root 沿该上游已有的阻断信息确定（直接上游记录缺失时以缺失的作业号
-//     本身为根因），与运行中发生的依赖级联遵守同一项规则。
-//   - upstreamUnavailable=false 且 reason != ""：全部直接上游都有效，只是
-//     本作业保存的追加输入与上游总和按位置对不上。这属于本作业自身归档
-//     有误，不能把有效上游判成失败或归因给它，BlockerID 保持 0。
-//   - reason == ""：对应关系成立，记录保持成功。
-//
-// 只读上游状态，绝不因下游追加值错误改动上游。调用前须已通过
-// effectiveInputsCorrespond（保证追加部分长度恰为依赖数量）。
-func dependencyInputsCheck(j *storedJob, byID map[uint64]*storedJob) (depID uint64, upstreamUnavailable bool, reason string) {
-	// 第一趟：按保存的依赖顺序找出最靠前的不可用上游。
-	for _, id := range j.dependencies {
-		dep := byID[id]
-		if dep == nil || dep.status != StatusSucceeded || dep.archive == nil {
-			return id, true,
-				fmt.Sprintf("直接上游作业 %d 无法使用：不存在或恢复后未保持带完整归档的成功状态，成功结果不可用", id)
-		}
-	}
-	// 第二趟：全部直接上游都有效，追加值按位置逐项核对，选出最靠前的不符。
-	n := len(j.values)
-	for i, id := range j.dependencies {
-		dep := byID[id]
-		if j.effectiveValues[n+i] != dep.archive.Sum {
-			return id, false,
-				fmt.Sprintf("实际输入的追加部分与直接上游作业 %d 的总和无法对应（追加值须按保存的依赖顺序逐项等于各上游总和），成功结果不可用", id)
-		}
-	}
-	return 0, false, ""
-}
-
-// restoredBlockedReason 构造重开归档时“因直接上游结果失效而失败”的原因：
-// detail 说明直接上游 depID 为何无法使用及其成功结果不可用；随后附上该
-// 直接上游自身的失败原因，直接上游与根因 root 不同或直接上游记录缺失时，
-// 再说明沿链条保留的根因作业号。
-func restoredBlockedReason(dep *storedJob, depID, root uint64, detail string) string {
-	reason := detail + "，阻断本作业继续计算"
-	if dep != nil && dep.status == StatusFailed && dep.failureReason != "" {
-		reason += "（其失败原因：" + dep.failureReason + "）"
-	}
-	if root != depID {
-		reason += fmt.Sprintf("；阻断根因为作业 %d", root)
-	}
-	return reason
 }
 
 // archiveIntact 复算成功归档的全部确定性字段，任何不一致都视为不可用。
