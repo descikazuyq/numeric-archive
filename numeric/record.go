@@ -239,6 +239,26 @@ func syncDir(dir string) {
 	}
 }
 
+// failRestoredJob 把恢复阶段判定失败的作业就地改判为失败终态，并尽力把终态
+// 原子写回该作业的记录文件，使按作业号读取、按提交人列举与磁盘记录保留相同
+// 的状态与根因。已有完成时间的记录保留该时间，只有没有完成时间的失败记录
+// 才补上当前时间；成功归档与实际计算输入一并清除。中断的运行作业、校验不
+// 通过的成功归档与被上游阻断的作业共用此处理，区别只在于失败原因与根因
+// 作业号由调用方按各自规则给出。
+func failRestoredJob(dir string, j *storedJob, reason string, blocker uint64) {
+	j.status = StatusFailed
+	j.failureReason = reason
+	j.blockerID = blocker
+	if j.finishedAt.IsZero() {
+		j.finishedAt = time.Now().UTC()
+	}
+	j.effectiveValues = nil
+	j.archive = nil
+	if data, err := encodeRecord(j); err == nil {
+		_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
+	}
+}
+
 // loadDir 扫描目录中的全部作业记录并重建内存索引。
 //
 // 恢复规则：
@@ -331,18 +351,7 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			archive:         r.Archive,
 		}
 		if j.status == StatusRunning {
-			j.status = StatusFailed
-			j.failureReason = "计算被中断：归档上次关闭时作业仍在运行"
-			j.blockerID = 0
-			if j.finishedAt.IsZero() {
-				j.finishedAt = time.Now().UTC()
-			}
-			j.effectiveValues = nil
-			j.archive = nil
-			// 就地重写恢复后的终态。
-			if data, err := encodeRecord(j); err == nil {
-				_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
-			}
+			failRestoredJob(dir, j, "计算被中断：归档上次关闭时作业仍在运行", 0)
 		}
 		if j.status == StatusSucceeded {
 			// 除完整性外，还必须满足两条独立的对应/复算规则：
@@ -367,18 +376,8 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 				invalidReason = "归档数值结果与有效输入按计算规则应得的结果不符，成功结果不可用"
 			}
 			if invalidReason != "" {
-				j.status = StatusFailed
-				j.failureReason = invalidReason
 				// 归档自身校验不通过：属于本作业自身失败，不携带阻断根因。
-				j.blockerID = 0
-				if j.finishedAt.IsZero() {
-					j.finishedAt = time.Now().UTC()
-				}
-				j.effectiveValues = nil
-				j.archive = nil
-				if data, err := encodeRecord(j); err == nil {
-					_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
-				}
+				failRestoredJob(dir, j, invalidReason, 0)
 			}
 		}
 		jobs = append(jobs, j)
@@ -410,21 +409,6 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	for _, j := range jobs {
 		byID[j.id] = j
 	}
-	// failRestored 把恢复阶段判定失败的作业就地改判并原子改写落盘记录，
-	// 使按作业号读取、按提交人列举与磁盘记录保留相同的根因。
-	failRestored := func(j *storedJob, reason string, root uint64) {
-		j.status = StatusFailed
-		j.failureReason = reason
-		j.blockerID = root
-		if j.finishedAt.IsZero() {
-			j.finishedAt = time.Now().UTC()
-		}
-		j.effectiveValues = nil
-		j.archive = nil
-		if data, err := encodeRecord(j); err == nil {
-			_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
-		}
-	}
 	for _, j := range jobs {
 		if len(j.dependencies) == 0 {
 			continue
@@ -438,14 +422,14 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 				// 因直接上游结果失效而失败：根因沿该上游已有的阻断信息保留，
 				// 直接上游记录缺失时以缺失的作业号本身作为根因。
 				root := blockerRoot(dep, directID)
-				failRestored(j, blockedFailureReason(restoredArchiveHead(directID), dep, directID, root), root)
+				failRestoredJob(dir, j, blockedFailureReason(restoredArchiveHead(directID), dep, directID, root), root)
 				continue
 			}
 			// 第二趟：直接上游全部存在且有效，只是本作业保存的追加输入与上游
 			// 总和按位置对不上——属于本作业自身归档有误，不把有效上游判成
 			// 失败或归因给它，BlockerID 保持 0。
 			if _, detail, mismatch := firstAppendedMismatch(j, byID); mismatch {
-				failRestored(j, detail, 0)
+				failRestoredJob(dir, j, detail, 0)
 			}
 		case StatusQueued:
 			// 按保存的依赖顺序选取最靠前的不可用上游；其他上游作业号更小
@@ -458,10 +442,10 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			if direct == nil {
 				// 直接上游的记录在归档目录中缺失，其结果不可能再变为可用：
 				// 以缺失的作业号作为根因，并明确说明结果无法使用。
-				failRestored(j, blockedFailureReason(restoredMissingHead(directID), nil, directID, root), root)
+				failRestoredJob(dir, j, blockedFailureReason(restoredMissingHead(directID), nil, directID, root), root)
 				continue
 			}
-			failRestored(j, blockedFailureReason(runtimeBlockedHead(direct), direct, directID, root), root)
+			failRestoredJob(dir, j, blockedFailureReason(runtimeBlockedHead(direct), direct, directID, root), root)
 		}
 	}
 	return jobs, maxID, nil
