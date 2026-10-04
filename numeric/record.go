@@ -245,7 +245,10 @@ func syncDir(dir string) {
 //   - 上次关闭时仍为 running 的作业标记为失败，原因是计算被中断；
 //   - 成功记录缺少归档、校验值对不上，实际输入与原始参数或直接依赖数量
 //     不对应，或归档数值结果与有效输入按计算规则应得的结果不符时，
-//     fail-closed 地标记为失败，维持“成功必有完整归档”的不变量。
+//     fail-closed 地标记为失败，维持“成功必有完整归档”的不变量；
+//   - 有依赖的成功记录还要求每个直接上游都存在、恢复后仍是带完整归档的
+//     成功状态，且实际输入的追加部分逐项等于这些上游按保存的依赖顺序
+//     排列的总和；对不上或上游不可用的同样改判为失败。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -348,7 +351,9 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			//  2. 归档中的数值结果必须与实际输入按既有计算规则应得的结果一致：
 			//     日志、摘要与校验值都可能与错误数字自洽，只有按保存的实际
 			//     输入复算才能识别。
-			// 任一不符合都按损坏归档处理。
+			// 任一不符合都按损坏归档处理。第三条规则——追加部分逐项等于各
+			// 直接上游恢复后的总和——需要全部记录恢复完毕才能核对，
+			// 在排序后的第二趟扫描中执行。
 			var invalidReason string
 			switch {
 			case !archiveIntact(j):
@@ -384,7 +389,60 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	sort.Slice(jobs, func(a, b int) bool {
 		return jobs[a].id < jobs[b].id
 	})
+	// 第二趟校验：有依赖的成功记录，其实际输入的追加部分必须与直接上游
+	// 恢复后的结果逐项对应。上游作业号必然更小，按升序单趟扫描即可让
+	// “上游本次被改判失败”沿成功链条传播到更下游——下游看到的一定是
+	// 上游已经确定的最终状态。
+	byID := make(map[uint64]*storedJob, len(jobs))
+	for _, j := range jobs {
+		byID[j.id] = j
+	}
+	for _, j := range jobs {
+		if j.status != StatusSucceeded || len(j.dependencies) == 0 {
+			continue
+		}
+		reason := dependencyInputsFailure(j, byID)
+		if reason == "" {
+			continue
+		}
+		j.status = StatusFailed
+		j.failureReason = reason
+		if j.finishedAt.IsZero() {
+			j.finishedAt = time.Now().UTC()
+		}
+		j.effectiveValues = nil
+		j.archive = nil
+		// 可正常写入时，保存的记录同样改写为失败。
+		if data, err := encodeRecord(j); err == nil {
+			_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
+		}
+	}
 	return jobs, maxID, nil
+}
+
+// dependencyInputsFailure 核对有依赖的成功记录：实际输入的追加部分（原始
+// 序列之后的 len(dependencies) 个位置）必须与直接上游恢复后的结果对应——
+//   - 每个直接上游都必须存在、恢复后仍是成功状态且带有通过全部校验的完整
+//     归档；上游在本次打开中被其他校验改判失败的，本作业也不能继续使用它；
+//   - 追加部分逐项等于这些上游按保存的依赖顺序排列的总和。负数、零以及
+//     不同上游恰好同和都按位置判断，不要求上游总和互不相同。
+//
+// 返回空串表示对应关系成立；否则返回指出具体直接上游作业号、并说明成功
+// 结果不可用的失败原因。只读上游状态，绝不因下游追加值错误改动上游。
+//
+// 调用前须已通过 effectiveInputsCorrespond（保证追加部分长度恰为依赖数量）。
+func dependencyInputsFailure(j *storedJob, byID map[uint64]*storedJob) string {
+	n := len(j.values)
+	for i, id := range j.dependencies {
+		dep := byID[id]
+		if dep == nil || dep.status != StatusSucceeded || dep.archive == nil {
+			return fmt.Sprintf("直接上游作业 %d 无法使用：不存在或恢复后未保持带完整归档的成功状态，成功结果不可用", id)
+		}
+		if j.effectiveValues[n+i] != dep.archive.Sum {
+			return fmt.Sprintf("实际输入的追加部分与直接上游作业 %d 的总和无法对应（追加值须按保存的依赖顺序逐项等于各上游总和），成功结果不可用", id)
+		}
+	}
+	return ""
 }
 
 // archiveIntact 复算成功归档的全部确定性字段，任何不一致都视为不可用。
