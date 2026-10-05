@@ -46,7 +46,10 @@ type Store struct {
 	byID   map[uint64]*storedJob
 	idem   map[idemIdentity]uint64 // (提交人, 请求号) -> 作业号
 	nextID uint64
-	closed bool
+	closed  bool
+	// closeDone 在本次关闭彻底完成（worker 退出、运行中作业的关闭处理已落盘）
+	// 后被关闭；并发的后续 Close 调用等待它，而不是仅因前一次已开始关闭就提前返回。
+	closeDone chan struct{}
 
 	now func() time.Time
 
@@ -89,9 +92,10 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		byID:   make(map[uint64]*storedJob),
 		idem:   make(map[idemIdentity]uint64),
 		nextID: maxID + 1,
-		now:    wallClock{}.Now,
-		waitCh: make(chan struct{}, 1),
-		stopCh: make(chan struct{}),
+		now:       wallClock{}.Now,
+		waitCh:    make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+		closeDone: make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -111,10 +115,18 @@ func Open(dir string, opts ...Option) (*Store, error) {
 
 // Close 关闭归档。正在运行的作业会尽快中止并标记为失败（计算被中断），
 // 排队作业原样保留在磁盘上，下次 [Open] 继续。
+//
+// 并发或重复的 Close 调用共同完成同一次关闭：每个调用都等到计算确实停止、
+// 相关作业的关闭处理结束后才返回，因此任何一次 Close 成功返回都意味着可以
+// 安全地重新打开同一目录。归档完全关闭后再调用 Close 立即成功返回。
 func (s *Store) Close() error {
 	s.mu.Lock()
 	if s.closed {
+		done := s.closeDone
 		s.mu.Unlock()
+		// 前一次调用已经开始（或已经完成）关闭：等到这次关闭彻底完成再返回，
+		// 不能让调用方在旧计算仍在写记录时就去重新打开目录。
+		<-done
 		return nil
 	}
 	s.closed = true
@@ -133,6 +145,7 @@ func (s *Store) Close() error {
 	}
 	s.notify()
 	s.wg.Wait()
+	close(s.closeDone)
 	return nil
 }
 
