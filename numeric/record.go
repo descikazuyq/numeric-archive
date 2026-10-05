@@ -248,8 +248,10 @@ func syncDir(dir string) {
 //     仅追加输入对不上而上游全部有效的属于本作业自身归档有误，BlockerID
 //     保持 0。排队记录的依赖列表重复引用同一作业号，或引用作业号不小于
 //     自己的作业（自己/后来作业），同样在恢复时直接判失败（BlockerID 为
-//     0），不再等待或开始计算；仍在排队的其他作业在同一趟升序扫描中按
-//     既有依赖规则级联失败。
+//     0），不再等待或开始计算；排队记录的原始整数序列为空（缺省、null 或
+//     空数组）也直接判失败（BlockerID 为 0）——提交时即拒绝空序列，恢复时
+//     不能凭已有实际输入或成功上游的总和补出原始参数后继续计算。仍在排队
+//     的其他作业在同一趟升序扫描中按既有依赖规则级联失败。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -396,11 +398,11 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	// 只有本作业自身归档有误（上游全部有效、仅保存的追加输入不符）时
 	// BlockerID 才保持 0。
 	//   - 带依赖的成功记录：追加部分与上游恢复后的结果逐项核对；
-	//   - 排队记录：先检查依赖列表自身是否合法——重复引用同一作业号，或
-	//     引用作业号不小于自己的作业（自己或后来作业），都属本作业自身有误，
-	//     BlockerID 为 0，立即失败且重复检查优先（保留现有重复失败说明）；
-	//     再按保存的依赖顺序选取最靠前的不可用上游（已失败/取消，或记录
-	//     缺失），立即级联失败，不再等待。
+	//   - 排队记录：先检查记录自身是否合法——依赖列表重复引用同一作业号、
+	//     引用作业号不小于自己的作业（自己或后来作业），或原始整数序列为空，
+	//     都属本作业自身有误，BlockerID 为 0，立即失败（重复检查最前，空序列
+	//     检查最后）；再按保存的依赖顺序选取最靠前的不可用上游（已失败/取消，
+	//     或记录缺失），立即级联失败，不再等待。
 	//
 	// 依赖列表自身不合法属于记录自身问题，先于一切上游可用性判断：即使被引用
 	// 的上游仍在排队或确实存在且成功，不合法记录也要立即失败；而等待该记录
@@ -410,6 +412,34 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		byID[j.id] = j
 	}
 	for _, j := range jobs {
+		if j.status == StatusQueued {
+			// 排队记录自身有误的三项检查先于一切上游可用性判断，对有无依赖的
+			// 记录同样适用（无依赖时前两项自然不命中）：
+			//  1. 依赖列表重复引用同一作业号：不能开始计算，也不能把同一上游
+			//     总和追加两次后继续。BlockerID 保持 0，不把被重复引用且原本
+			//     有效的上游改成失败。
+			//  2. 依赖先后关系不合法：直接上游作业号必须严格小于本作业号，
+			//     引用自己或后来作业即使被引用者存在且成功也不能接受，不能开始
+			//     计算或继续等待。排在重复检查之后，已因重复依赖判失败的记录
+			//     保留现有说明。
+			//  3. 原始整数序列为空（缺省、null 或空数组）：提交时即拒绝空序列，
+			//     恢复时遵守同一项输入要求——不能开始运行，也不能凭已有实际输入
+			//     或成功上游的总和补出原始参数。BlockerID 保持 0。空序列指没有
+			//     任何原始整数；[0]、[0,0] 等非空序列仍是合法输入，不按总和
+			//     是否为 0 判断。
+			if dupID, dup := duplicateDependency(j); dup {
+				failRestoredJob(dir, j, duplicateDependencyReason(dupID), 0)
+				continue
+			}
+			if badID, bad := firstIllegalOrderingDependency(j); bad {
+				failRestoredJob(dir, j, illegalOrderingDependencyReason(badID, j.id), 0)
+				continue
+			}
+			if len(j.values) == 0 {
+				failRestoredJob(dir, j, emptyOriginalValuesReason(), 0)
+				continue
+			}
+		}
 		if len(j.dependencies) == 0 {
 			continue
 		}
@@ -432,23 +462,8 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 				failRestoredJob(dir, j, detail, 0)
 			}
 		case StatusQueued:
-			// 排队记录的依赖列表同样不能重复引用同一作业号：这属于本作业记录
-			// 自身有误，在选取不可用上游之前直接判失败——不能开始计算，也不能
-			// 把同一上游总和追加两次后继续。BlockerID 保持 0，不把被重复引用
-			// 且原本有效的上游改成失败。
-			if dupID, dup := duplicateDependency(j); dup {
-				failRestoredJob(dir, j, duplicateDependencyReason(dupID), 0)
-				continue
-			}
-			// 依赖先后关系同样是记录自身问题：直接上游作业号必须严格小于本作业号，
-			// 引用自己或后来作业即使被引用者存在且成功也不能接受，不能开始计算或
-			// 继续等待。排在重复检查之后，已因重复依赖判失败的记录保留现有说明。
-			if badID, bad := firstIllegalOrderingDependency(j); bad {
-				failRestoredJob(dir, j, illegalOrderingDependencyReason(badID, j.id), 0)
-				continue
-			}
-			// 按保存的依赖顺序选取最靠前的不可用上游；其他上游作业号更小
-			// 或失败原因不同都不能改变这个选择。
+			// 记录自身的三项检查已在上面完成；这里按保存的依赖顺序选取最靠前
+			// 的不可用上游，其他上游作业号更小或失败原因不同都不能改变这个选择。
 			directID, direct, blocked := pickBlockingUpstream(j, byID, restoredQueuedUpstreamBlocked)
 			if !blocked {
 				continue // 上游仍在排队等情况：继续等待，不挡住其他作业。
@@ -467,7 +482,7 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 }
 
 // failRestoredJob 收拢重新打开归档时把恢复出的作业改判为失败的统一处理，
-// 供五类恢复失败共用（调用顺序即各类判定的既有先后）：
+// 供六类恢复失败共用（调用顺序即各类判定的既有先后）：
 //   - 上次关闭时仍在运行的作业：计算被中断（第一趟记录扫描）；
 //   - 原标为成功、但归档完整性、依赖列表唯一性或先后关系、实际输入对应
 //     关系或数值结果不符规则的作业：本作业自身归档校验失败（第一趟记录
@@ -475,8 +490,11 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 //   - 排队记录的依赖列表重复引用同一作业号：本作业记录自身有误（第二趟升序
 //     扫描，BlockerID 恒 0，先于上游可用性判断）；
 //   - 排队记录引用作业号不小于自己的作业（自己/后来作业）：本作业记录自身
-//     有误（第二趟升序扫描，BlockerID 恒 0，在重复检查之后、上游可用性
-//     判断之前）；
+//     有误（第二趟升序扫描，BlockerID 恒 0，在重复检查之后、空序列检查与
+//     上游可用性判断之前）；
+//   - 排队记录的原始整数序列为空（缺省、null 或空数组）：本作业记录自身
+//     有误（第二趟升序扫描，BlockerID 恒 0，在依赖列表自身合法性检查之后、
+//     上游可用性判断之前）；
 //   - 被不可用直接上游阻断的作业：成功记录复核与排队记录复查（第二趟升序扫描），
 //     BlockerID 由调用方按 blocker.go 的归因规则给出。
 //
