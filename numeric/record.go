@@ -145,6 +145,7 @@ func (s *Store) jobPath(j *storedJob) string {
 }
 
 func encodeRecord(j *storedJob) ([]byte, error) {
+	hasDependency, dependencyID := legacyDependencyFields(j.dependencies)
 	r := jobRecord{
 		Version: recordVersion,
 
@@ -154,8 +155,8 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 		IdentityRaw:   rawIdentity(j.submitter, j.requestID),
 		Seed:          j.seed,
 		Values:        append([]int64(nil), j.values...),
-		HasDependency: len(j.dependencies) > 0,
-		DependencyID:  depID(j),
+		HasDependency: hasDependency,
+		DependencyID:  dependencyID,
 		Dependencies:  append([]uint64(nil), j.dependencies...),
 
 		QueuedAt:      j.queuedAt,
@@ -169,14 +170,6 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 		Archive:         j.archive,
 	}
 	return json.MarshalIndent(&r, "", "  ")
-}
-
-// depID 返回首个直接上游作业号（无依赖时为 0）。
-func depID(j *storedJob) uint64 {
-	if len(j.dependencies) == 0 {
-		return 0
-	}
-	return j.dependencies[0]
 }
 
 // persist 在已持锁的情况下原子写一条作业记录。
@@ -311,11 +304,9 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			return nil, 0, fmt.Errorf("numeric: 记录 %s 状态非法: %q", name, r.Status)
 		}
 		// 新格式记录直接给出有序依赖列表；旧格式记录只有单依赖字段，
-		// 恢复为只含一个作业号的列表（语义与提交时一致）。
-		deps := append([]uint64(nil), r.Dependencies...)
-		if len(deps) == 0 && r.HasDependency {
-			deps = []uint64{r.DependencyID}
-		}
+		// 恢复为只含一个作业号的列表（语义与提交时一致）。两类字段同时
+		// 出现时以非空列表为实际依赖，与提交、归档核对共用同一换算。
+		deps := normalizeDependencies(r.HasDependency, r.DependencyID, r.Dependencies)
 		j := &storedJob{
 			id:           r.ID,
 			submitter:    submitter,
@@ -517,19 +508,17 @@ func archiveIntact(j *storedJob) bool {
 		return false
 	}
 	// 归档中的原始参数必须与记录顶层字段一致。
+	wantHasDependency, wantDependencyID := legacyDependencyFields(j.dependencies)
 	if a.JobID != j.id || a.Submitter != j.submitter || a.RequestID != j.requestID ||
-		a.Seed != j.seed || a.HasDependency != (len(j.dependencies) > 0) {
+		a.Seed != j.seed || a.HasDependency != wantHasDependency {
 		return false
 	}
-	if a.HasDependency && a.DependencyID != depID(j) {
+	if a.HasDependency && a.DependencyID != wantDependencyID {
 		return false
 	}
 	// 依赖列表（内容与次序）必须一致。旧格式归档没有 dependencies 字段，
-	// 由单依赖字段推导后再比较。
-	aDeps := append([]uint64(nil), a.Dependencies...)
-	if len(aDeps) == 0 && a.HasDependency {
-		aDeps = []uint64{a.DependencyID}
-	}
+	// 由单依赖字段推导后再比较，与记录恢复、提交内容比较共用同一换算。
+	aDeps := normalizeDependencies(a.HasDependency, a.DependencyID, a.Dependencies)
 	if len(aDeps) != len(j.dependencies) {
 		return false
 	}

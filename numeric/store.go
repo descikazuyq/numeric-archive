@@ -230,18 +230,13 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	return s.viewLocked(j), nil
 }
 
-// requestDeps 规范化一次提交的直接上游作业号列表：
-// 非空 Dependencies 优先（保持次序）；否则单依赖方式退化为只含一个作业号的列表；
-// 两者皆无则为 nil。调用前须先经 [Store.validateDependencyShapeLocked] 与
-// （新请求路径上的）[Store.validateDependenciesExistLocked] 校验。
+// requestDeps 规范化一次提交的直接上游作业号列表，与记录、归档共用 deps.go
+// 中的同一换算：非空 Dependencies 优先（保持次序）；否则单依赖方式退化为只含
+// 一个作业号的列表；两者皆无则为 nil。调用前须先经
+// [Store.validateDependencyShapeLocked] 与（新请求路径上的）
+// [Store.validateDependenciesExistLocked] 校验。
 func requestDeps(req *SubmitRequest) []uint64 {
-	if len(req.Dependencies) > 0 {
-		return append([]uint64(nil), req.Dependencies...)
-	}
-	if req.HasDependency {
-		return []uint64{req.DependencyID}
-	}
-	return nil
+	return normalizeDependencies(req.HasDependency, req.DependencyID, req.Dependencies)
 }
 
 // validateDependencyShapeLocked 在持锁状态下校验提交依赖列表中与上游存在性
@@ -608,10 +603,7 @@ func newArchive(j *storedJob, effective []int64, sum, sumSquares int64, complete
 	resDigest := resultDigestHex(effective, j.seed, sum, sumSquares)
 	log := buildLog(effective, j.seed, sum, sumSquares)
 	checksum := checksumHex(effective, j.seed, sum, sumSquares, log, resDigest)
-	var firstDep uint64
-	if len(j.dependencies) > 0 {
-		firstDep = j.dependencies[0]
-	}
+	hasDependency, dependencyID := legacyDependencyFields(j.dependencies)
 	return &Archive{
 		JobID:           j.id,
 		Submitter:       j.submitter,
@@ -619,8 +611,8 @@ func newArchive(j *storedJob, effective []int64, sum, sumSquares int64, complete
 		IdentityRaw:     rawIdentity(j.submitter, j.requestID),
 		Seed:            j.seed,
 		Values:          append([]int64(nil), j.values...),
-		HasDependency:   len(j.dependencies) > 0,
-		DependencyID:    firstDep,
+		HasDependency:   hasDependency,
+		DependencyID:    dependencyID,
 		Dependencies:    append([]uint64(nil), j.dependencies...),
 		EffectiveValues: append([]int64(nil), effective...),
 		InputsDigest:    inDigest,
@@ -650,10 +642,7 @@ func (s *Store) viewLocked(j *storedJob) *Job {
 		BlockerID:       j.blockerID,
 		EffectiveValues: append([]int64(nil), j.effectiveValues...),
 	}
-	v.HasDependency = len(j.dependencies) > 0
-	if len(j.dependencies) > 0 {
-		v.DependencyID = j.dependencies[0]
-	}
+	v.HasDependency, v.DependencyID = legacyDependencyFields(j.dependencies)
 	if j.status == StatusQueued {
 		v.WaitReason = WaitSlot
 		// 列出尚未成功归档的直接上游，保持提交时的顺序。
