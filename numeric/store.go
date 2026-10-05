@@ -129,15 +129,20 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
+	// 停止标记必须与 closed 在同一次持锁中生效：Submit 的拒绝、worker 的
+	// “是否从队列启动新计算”与“是否把刚结束的计算确认为成功”都观察同一把
+	// 锁。若先放开锁再置 stopping，worker 可能在这个窗口内通过循环开头的
+	// 检查并启动排队作业，或把尚未确认保存的计算按成功落盘——调用方已经在
+	// 被 ErrStoreClosed 拒绝，却仍能拿到关闭过程新产生的成功结果。
+	if s.stopping.CompareAndSwap(false, true) {
+		close(s.stopCh)
+	}
 	var running *storedJob
 	if s.runningID != 0 {
 		running = s.byID[s.runningID]
 	}
 	s.mu.Unlock()
 
-	if s.stopping.CompareAndSwap(false, true) {
-		close(s.stopCh)
-	}
 	// 中止正在运行的计算。
 	if running != nil {
 		running.canceled.Store(true)
