@@ -111,10 +111,21 @@ func Open(dir string, opts ...Option) (*Store, error) {
 
 // Close 关闭归档。正在运行的作业会尽快中止并标记为失败（计算被中断），
 // 排队作业原样保留在磁盘上，下次 [Open] 继续。
+//
+// 多次 Close（含并发调用）共同完成对同一个归档对象的一次关闭：每个调用都
+// 等到 worker 退出、运行中作业的中断处理已经落盘后才成功返回。后发调用
+// 不能只因为前一次调用已把关闭标记置位就提前返回——否则调用方可能据此立即
+// 重新打开目录，而旧 worker 仍在补写运行作业的结果。归档完全关闭后的再次
+// Close 立即成功返回；空闲归档（无运行中作业）也直接完成关闭。
 func (s *Store) Close() error {
 	s.mu.Lock()
 	if s.closed {
+		// 关闭可能正由另一次并发 Close 进行。wg 在 Open 时 +1、worker 退出
+		// 时归零；Wait 允许被多个 goroutine 同时等待，所有调用都在同一次
+		// 关闭真正完成（worker 已退出、再无计算与补写）时才返回。
+		// 已完全关闭时计数早已归零，这里立即成功返回。
 		s.mu.Unlock()
+		s.wg.Wait()
 		return nil
 	}
 	s.closed = true
