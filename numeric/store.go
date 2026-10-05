@@ -230,20 +230,6 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	return s.viewLocked(j), nil
 }
 
-// requestDeps 规范化一次提交的直接上游作业号列表：
-// 非空 Dependencies 优先（保持次序）；否则单依赖方式退化为只含一个作业号的列表；
-// 两者皆无则为 nil。调用前须先经 [Store.validateDependencyShapeLocked] 与
-// （新请求路径上的）[Store.validateDependenciesExistLocked] 校验。
-func requestDeps(req *SubmitRequest) []uint64 {
-	if len(req.Dependencies) > 0 {
-		return append([]uint64(nil), req.Dependencies...)
-	}
-	if req.HasDependency {
-		return []uint64{req.DependencyID}
-	}
-	return nil
-}
-
 // validateDependencyShapeLocked 在持锁状态下校验提交依赖列表中与上游存在性
 // 无关的结构问题：
 //   - 单依赖方式与非空列表同时启用 → 拒绝；
@@ -297,19 +283,14 @@ func (s *Store) missingDependencyNoteLocked(deps []uint64) string {
 }
 
 // sameContent 判断两次提交的内容是否一致；整数次序或依赖列表（内容与次序）
-// 不同即视为不同内容。单依赖方式与只含同一作业号的列表视为相同内容。
+// 不同即视为不同内容。依赖内容统一经 requestDeps 规范化后用 depsEqual 按原
+// 次序比较，单依赖方式与只含同一作业号的列表视为相同内容。
 func sameContent(j *storedJob, req *SubmitRequest) bool {
 	if j.seed != req.Seed {
 		return false
 	}
-	rd := requestDeps(req)
-	if len(j.dependencies) != len(rd) {
+	if !depsEqual(j.dependencies, requestDeps(req)) {
 		return false
-	}
-	for i := range j.dependencies {
-		if j.dependencies[i] != rd[i] {
-			return false
-		}
 	}
 	if len(j.values) != len(req.Values) {
 		return false
@@ -608,10 +589,6 @@ func newArchive(j *storedJob, effective []int64, sum, sumSquares int64, complete
 	resDigest := resultDigestHex(effective, j.seed, sum, sumSquares)
 	log := buildLog(effective, j.seed, sum, sumSquares)
 	checksum := checksumHex(effective, j.seed, sum, sumSquares, log, resDigest)
-	var firstDep uint64
-	if len(j.dependencies) > 0 {
-		firstDep = j.dependencies[0]
-	}
 	return &Archive{
 		JobID:           j.id,
 		Submitter:       j.submitter,
@@ -620,7 +597,7 @@ func newArchive(j *storedJob, effective []int64, sum, sumSquares int64, complete
 		Seed:            j.seed,
 		Values:          append([]int64(nil), j.values...),
 		HasDependency:   len(j.dependencies) > 0,
-		DependencyID:    firstDep,
+		DependencyID:    firstDep(j.dependencies),
 		Dependencies:    append([]uint64(nil), j.dependencies...),
 		EffectiveValues: append([]int64(nil), effective...),
 		InputsDigest:    inDigest,
@@ -650,10 +627,10 @@ func (s *Store) viewLocked(j *storedJob) *Job {
 		BlockerID:       j.blockerID,
 		EffectiveValues: append([]int64(nil), j.effectiveValues...),
 	}
+	// 单依赖视图字段按实际依赖列表统一派生：有依赖时 HasDependency 为 true、
+	// DependencyID 为按原次序的首个上游；完整列表另由 Dependencies 表达。
 	v.HasDependency = len(j.dependencies) > 0
-	if len(j.dependencies) > 0 {
-		v.DependencyID = j.dependencies[0]
-	}
+	v.DependencyID = firstDep(j.dependencies)
 	if j.status == StatusQueued {
 		v.WaitReason = WaitSlot
 		// 列出尚未成功归档的直接上游，保持提交时的顺序。

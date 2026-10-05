@@ -155,7 +155,7 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 		Seed:          j.seed,
 		Values:        append([]int64(nil), j.values...),
 		HasDependency: len(j.dependencies) > 0,
-		DependencyID:  depID(j),
+		DependencyID:  firstDep(j.dependencies),
 		Dependencies:  append([]uint64(nil), j.dependencies...),
 
 		QueuedAt:      j.queuedAt,
@@ -169,14 +169,6 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 		Archive:         j.archive,
 	}
 	return json.MarshalIndent(&r, "", "  ")
-}
-
-// depID 返回首个直接上游作业号（无依赖时为 0）。
-func depID(j *storedJob) uint64 {
-	if len(j.dependencies) == 0 {
-		return 0
-	}
-	return j.dependencies[0]
 }
 
 // persist 在已持锁的情况下原子写一条作业记录。
@@ -310,12 +302,11 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		default:
 			return nil, 0, fmt.Errorf("numeric: 记录 %s 状态非法: %q", name, r.Status)
 		}
-		// 新格式记录直接给出有序依赖列表；旧格式记录只有单依赖字段，
-		// 恢复为只含一个作业号的列表（语义与提交时一致）。
-		deps := append([]uint64(nil), r.Dependencies...)
-		if len(deps) == 0 && r.HasDependency {
-			deps = []uint64{r.DependencyID}
-		}
+		// 依赖内容统一经 recordDeps 恢复（与成功归档核对同一套规则）：
+		// 新格式记录直接给出有序依赖列表（即使同时保存了单依赖字段也以列表
+		// 为准，不套用提交请求的互斥要求）；旧格式记录只有单依赖字段时恢复
+		// 为只含该作业号的列表（语义与提交时一致）。
+		deps := recordDeps(r.HasDependency, r.DependencyID, r.Dependencies)
 		j := &storedJob{
 			id:           r.ID,
 			submitter:    submitter,
@@ -521,22 +512,16 @@ func archiveIntact(j *storedJob) bool {
 		a.Seed != j.seed || a.HasDependency != (len(j.dependencies) > 0) {
 		return false
 	}
-	if a.HasDependency && a.DependencyID != depID(j) {
+	if a.HasDependency && a.DependencyID != firstDep(j.dependencies) {
 		return false
 	}
-	// 依赖列表（内容与次序）必须一致。旧格式归档没有 dependencies 字段，
-	// 由单依赖字段推导后再比较。
-	aDeps := append([]uint64(nil), a.Dependencies...)
-	if len(aDeps) == 0 && a.HasDependency {
-		aDeps = []uint64{a.DependencyID}
-	}
-	if len(aDeps) != len(j.dependencies) {
+	// 依赖列表（内容与次序）必须一致。归档中的依赖字段与重开顶层记录一样
+	// 经 recordDeps 恢复（旧格式归档没有 dependencies 字段，由单依赖字段
+	// 推导；新格式即使同时保存单依赖字段也以列表为准），再用 depsEqual 与
+	// 作业实际依赖按原次序逐项比较。
+	aDeps := recordDeps(a.HasDependency, a.DependencyID, a.Dependencies)
+	if !depsEqual(aDeps, j.dependencies) {
 		return false
-	}
-	for i := range j.dependencies {
-		if aDeps[i] != j.dependencies[i] {
-			return false
-		}
 	}
 	if len(a.Values) != len(j.values) {
 		return false
