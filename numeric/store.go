@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -53,7 +52,6 @@ type Store struct {
 	runningID uint64
 	waitCh    chan struct{}
 	stopCh    chan struct{}
-	stopping  atomic.Bool
 	wg        sync.WaitGroup
 
 	// compute 仅用于包内确定性测试：若为空则使用真实的 [computeResult]。
@@ -112,6 +110,11 @@ func Open(dir string, opts ...Option) (*Store, error) {
 // Close 关闭归档。正在运行的作业会尽快中止并标记为失败（计算被中断），
 // 排队作业原样保留在磁盘上，下次 [Open] 继续。
 //
+// 关闭一旦在同一个临界区内生效（closed 置位、stopCh 关闭），提交与取消即开始
+// 返回 [ErrStoreClosed]；同一条关闭状态同时约束 worker：此后既不会从队列启动新
+// 的计算，也不会把当时尚未确认完成的计算补成成功——即使该计算已经返回总和与
+// 平方和。关闭前已完整保存的成功结果、已失败与已确认取消的终态都保持不变。
+//
 // 多次 Close（含并发调用）共同完成对同一个归档对象的一次关闭：每个调用都
 // 等到 worker 退出、运行中作业的中断处理已经落盘后才成功返回。后发调用
 // 不能只因为前一次调用已把关闭标记置位就提前返回——否则调用方可能据此立即
@@ -128,16 +131,17 @@ func (s *Store) Close() error {
 		s.wg.Wait()
 		return nil
 	}
+	// 在同一个临界区内让关闭状态对“拒绝提交/取消”和“停止调度/确认结果”同时
+	// 生效：closed 置位与 stopCh 关闭之间不留窗口，worker 也就不可能在提交
+	// 已开始返回 ErrStoreClosed 之后，又启动排队作业或把未确认的计算补成成功。
 	s.closed = true
+	close(s.stopCh)
 	var running *storedJob
 	if s.runningID != 0 {
 		running = s.byID[s.runningID]
 	}
 	s.mu.Unlock()
 
-	if s.stopping.CompareAndSwap(false, true) {
-		close(s.stopCh)
-	}
 	// 中止正在运行的计算。
 	if running != nil {
 		running.canceled.Store(true)
@@ -166,7 +170,7 @@ func (s *Store) Close() error {
 func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed || s.stopping.Load() {
+	if s.closed {
 		return nil, ErrStoreClosed
 	}
 	if len(req.Values) == 0 {
@@ -496,7 +500,7 @@ func (s *Store) worker() {
 	defer s.wg.Done()
 	for {
 		s.mu.Lock()
-		if s.stopping.Load() {
+		if s.closed {
 			s.mu.Unlock()
 			return
 		}
@@ -534,7 +538,20 @@ func (s *Store) worker() {
 		}
 		s.mu.Unlock()
 
-		abort := func() bool { return j.canceled.Load() || s.stopping.Load() }
+		// 计算在锁外执行，无法直接读 closed；stopCh 与 closed 在 Close 的同一个
+		// 临界区内关闭，因此对已关闭 stopCh 的非阻塞读与“关闭已生效”严格同义，
+		// 不会出现提交已被拒绝、计算中止信号却尚未置位的窗口。
+		abort := func() bool {
+			if j.canceled.Load() {
+				return true
+			}
+			select {
+			case <-s.stopCh:
+				return true
+			default:
+				return false
+			}
+		}
 		doCompute := s.compute
 		if doCompute == nil {
 			doCompute = func(_ uint64, in []int64, sd int64, c func() bool) (int64, int64, string, bool) {
@@ -552,7 +569,10 @@ func (s *Store) worker() {
 			j.effectiveValues = nil
 			_ = s.persistRetry(j, 3)
 			s.cascadeLocked()
-		case s.stopping.Load():
+		case s.closed:
+			// 关闭已生效：无论计算是否已经返回总和与平方和，只要成功结果尚未在
+			// 关闭生效前于本锁保护下确认保存，就一律按中断失败处理，不补成成功、
+			// 不返回成功归档或实际计算输入；等待它的下游照常按依赖失败级联。
 			s.markFailedLocked(j, "计算被中断：归档在计算过程中关闭", 0)
 			s.cascadeLocked()
 		case !ok:
