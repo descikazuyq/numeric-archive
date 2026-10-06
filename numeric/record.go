@@ -235,6 +235,14 @@ func syncDir(dir string) {
 // loadDir 扫描目录中的全部作业记录并重建内存索引。
 //
 // 恢复规则：
+//   - 两份或更多记录文件顶层保存相同作业号时（即使文件名不同或内容完全
+//     相同），本次打开直接失败并返回说明该作业号与冲突文件名的非空错误：
+//     一个稳定作业号只能对应一份已保存作业。该检查在所有记录都可正常解析、
+//     版本及状态合法之后、任何恢复改写之前完成，因此冲突时不会启动任何
+//     计算，也不会改判或补写目录内的任何原有记录（中断的运行记录、待复查
+//     的成功记录、排队记录等全部保持原样）；不按时间、状态、排列或完整度
+//     挑选一份，也不自动换号、合并或删除，调用方处理冲突后再次打开才按
+//     既有规则恢复；
 //   - 上次关闭时仍为 running 的作业标记为失败，原因是计算被中断；
 //   - 成功记录缺少归档、校验值对不上，依赖列表重复引用同一直接上游作业号，
 //     或直接上游作业号不小于本作业号（引用自己或后来作业，违反提交时的
@@ -257,7 +265,17 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	var jobs []*storedJob
+	// 第一阶段：只读解析全部记录文件，不进行任何恢复改写。这样重复作业号
+	// 检查可以在第一条记录被改判失败或补写结果之前作出判断：一个稳定作业号
+	// 只能对应一份已保存作业，两份顶层作业号相同的记录（文件名不同、内容
+	// 完全相同也不例外）必须让本次打开整体失败，而不是按文件排列、时间或
+	// 状态挑一份继续，也不能先按正常恢复规则把其他作业改判失败/补写结果再
+	// 报错——冲突时本次打开不启动任何计算，也不改写目录内任何原有记录。
+	type parsedRecord struct {
+		name string
+		job  *storedJob
+	}
+	var parsed []parsedRecord
 	var maxID uint64
 	for _, e := range entries {
 		name := e.Name()
@@ -272,62 +290,40 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		if !strings.HasPrefix(name, "job-") || !strings.HasSuffix(name, ".json") {
 			continue
 		}
-		path := filepath.Join(dir, name)
-		data, err := os.ReadFile(path)
+		j, err := parseJobRecord(dir, name)
 		if err != nil {
 			return nil, 0, err
 		}
-		var r jobRecord
-		if err := json.Unmarshal(data, &r); err != nil {
-			return nil, 0, fmt.Errorf("numeric: 记录 %s 损坏: %w", name, err)
+		parsed = append(parsed, parsedRecord{name: name, job: j})
+		if j.id > maxID {
+			maxID = j.id
 		}
-		if r.Version != recordVersion {
-			return nil, 0, fmt.Errorf("numeric: 记录 %s 版本不受支持: %s", name, r.Version)
-		}
-		// 提交人、请求号按完整字节恢复：含非法 UTF-8 字节时以
-		// identity_raw 兜底字段为准，普通文本（含 U+0000）与旧归档原样使用。
-		submitter, requestID, err := resolveIdentity(r.Submitter, r.RequestID, r.IdentityRaw)
-		if err != nil {
-			return nil, 0, fmt.Errorf("numeric: 记录 %s 标识损坏: %w", name, err)
-		}
-		// 成功归档内嵌同一份标识，同样按其自身兜底字段恢复，保证顶层记录
-		// 与归档中的参数逐字节一致。
-		if r.Archive != nil {
-			aSub, aReq, aErr := resolveIdentity(r.Archive.Submitter, r.Archive.RequestID, r.Archive.IdentityRaw)
-			if aErr != nil {
-				return nil, 0, fmt.Errorf("numeric: 记录 %s 归档标识损坏: %w", name, aErr)
-			}
-			r.Archive.Submitter = aSub
-			r.Archive.RequestID = aReq
-		}
-		switch r.Status {
-		case StatusQueued, StatusRunning, StatusSucceeded, StatusFailed, StatusCanceled:
-		default:
-			return nil, 0, fmt.Errorf("numeric: 记录 %s 状态非法: %q", name, r.Status)
-		}
-		// 新格式记录直接给出有序依赖列表；旧格式记录只有单依赖字段，
-		// 恢复为只含一个作业号的列表（语义与提交时一致）。两类字段同时
-		// 出现时以非空列表为实际依赖，与提交、归档核对共用同一换算。
-		deps := normalizeDependencies(r.HasDependency, r.DependencyID, r.Dependencies)
-		j := &storedJob{
-			id:           r.ID,
-			submitter:    submitter,
-			requestID:    requestID,
-			seed:         r.Seed,
-			values:       append([]int64(nil), r.Values...),
-			dependencies: deps,
+	}
 
-			queuedAt:   r.QueuedAt,
-			startedAt:  r.StartedAt,
-			finishedAt: r.FinishedAt,
-
-			status:        r.Status,
-			failureReason: r.FailureReason,
-			blockerID:     r.BlockerID,
-
-			effectiveValues: append([]int64(nil), r.EffectiveValues...),
-			archive:         r.Archive,
+	// 重复作业号检查：所有记录都可正常解析、版本与状态合法之后，在任何恢复
+	// 改写与第二趟依赖失效处理之前执行。检查按目录列举顺序进行，但结果不
+	// 依赖文件排列——只要同一作业号出现至少两次即构成冲突；错误中给出该
+	// 作业号以及全部冲突记录的文件名（至少两份），便于调用方定位。不按
+	// 提交时间、状态、排列或哪份带完整结果挑选，也不自动换号、合并参数或
+	// 删除冲突文件；调用方处理完冲突后再次打开才按既有规则恢复。
+	seen := make(map[uint64]*parsedRecord, len(parsed))
+	for i := range parsed {
+		rec := &parsed[i]
+		if prev, dup := seen[rec.job.id]; dup {
+			return nil, 0, duplicateJobIDError(rec.job.id, prev.name, rec.name)
 		}
+		seen[rec.job.id] = rec
+	}
+
+	jobs := make([]*storedJob, 0, len(parsed))
+	for _, rec := range parsed {
+		jobs = append(jobs, rec.job)
+	}
+
+	// 第二阶段：至此目录中每个作业号只对应一份记录，下面的既有恢复规则
+	// （中断改判、成功归档复核、排队记录自身有误与依赖失效级联）才允许
+	// 改写记录。第一趟状态修正只依赖单条记录自身，直接逐个执行即可。
+	for _, j := range jobs {
 		if j.status == StatusRunning {
 			failRestoredJob(dir, j, "计算被中断：归档上次关闭时作业仍在运行", 0)
 		}
@@ -374,10 +370,6 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 				// 归档自身校验不通过：属于本作业自身失败，不携带阻断根因。
 				failRestoredJob(dir, j, invalidReason, 0)
 			}
-		}
-		jobs = append(jobs, j)
-		if j.id > maxID {
-			maxID = j.id
 		}
 	}
 	// 恢复后的排列必须与关闭前的接受先后一致：作业号在接受时单调分配，
@@ -479,6 +471,83 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		}
 	}
 	return jobs, maxID, nil
+}
+
+// parseJobRecord 只读解析单个作业记录文件并构造内存中的恢复作业，不执行任何
+// 依赖其他记录的核对，也绝不写目录。原有的打开错误在此阶段继续有效并保持
+// 原有信息：JSON 无法解析（记录损坏）、版本不受支持、标识兜底字节损坏或
+// 状态非法都直接返回非空错误——这类记录不会因为同目录里恰好存在重复作业号
+// 而改变错误类型。
+//
+// running 改判与成功归档复核等会改写记录的恢复步骤不在此处进行：调用方先
+// 解析完全部记录并确认作业号无重复之后，才允许进入恢复改写阶段。
+func parseJobRecord(dir, name string) (*storedJob, error) {
+	path := filepath.Join(dir, name)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var r jobRecord
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("numeric: 记录 %s 损坏: %w", name, err)
+	}
+	if r.Version != recordVersion {
+		return nil, fmt.Errorf("numeric: 记录 %s 版本不受支持: %s", name, r.Version)
+	}
+	// 提交人、请求号按完整字节恢复：含非法 UTF-8 字节时以
+	// identity_raw 兜底字段为准，普通文本（含 U+0000）与旧归档原样使用。
+	submitter, requestID, err := resolveIdentity(r.Submitter, r.RequestID, r.IdentityRaw)
+	if err != nil {
+		return nil, fmt.Errorf("numeric: 记录 %s 标识损坏: %w", name, err)
+	}
+	// 成功归档内嵌同一份标识，同样按其自身兜底字段恢复，保证顶层记录
+	// 与归档中的参数逐字节一致。
+	if r.Archive != nil {
+		aSub, aReq, aErr := resolveIdentity(r.Archive.Submitter, r.Archive.RequestID, r.Archive.IdentityRaw)
+		if aErr != nil {
+			return nil, fmt.Errorf("numeric: 记录 %s 归档标识损坏: %w", name, aErr)
+		}
+		r.Archive.Submitter = aSub
+		r.Archive.RequestID = aReq
+	}
+	switch r.Status {
+	case StatusQueued, StatusRunning, StatusSucceeded, StatusFailed, StatusCanceled:
+	default:
+		return nil, fmt.Errorf("numeric: 记录 %s 状态非法: %q", name, r.Status)
+	}
+	// 新格式记录直接给出有序依赖列表；旧格式记录只有单依赖字段，
+	// 恢复为只含一个作业号的列表（语义与提交时一致）。两类字段同时
+	// 出现时以非空列表为实际依赖，与提交、归档核对共用同一换算。
+	deps := normalizeDependencies(r.HasDependency, r.DependencyID, r.Dependencies)
+	return &storedJob{
+		id:           r.ID,
+		submitter:    submitter,
+		requestID:    requestID,
+		seed:         r.Seed,
+		values:       append([]int64(nil), r.Values...),
+		dependencies: deps,
+
+		queuedAt:   r.QueuedAt,
+		startedAt:  r.StartedAt,
+		finishedAt: r.FinishedAt,
+
+		status:        r.Status,
+		failureReason: r.FailureReason,
+		blockerID:     r.BlockerID,
+
+		effectiveValues: append([]int64(nil), r.EffectiveValues...),
+		archive:         r.Archive,
+	}, nil
+}
+
+// duplicateJobIDError 构造重复作业号冲突的打开错误：明确说明存在重复作业号，
+// 包含该作业号以及至少两份冲突记录的文件名。更多冲突文件不逐个展开，但
+// first 与 second 已足以让调用方定位冲突；列出哪些文件不取决于提交时间、
+// 状态是否成功、文件排列或哪份带有完整结果。
+func duplicateJobIDError(id uint64, first, second string) error {
+	return fmt.Errorf("numeric: 归档目录存在重复作业号 %d：一个稳定作业号只能对应一份已保存作业，"+
+		"但记录文件 %s 与 %s 顶层保存了相同作业号；拒绝打开且不改动任何记录，请处理冲突文件后重试",
+		id, first, second)
 }
 
 // failRestoredJob 收拢重新打开归档时把恢复出的作业改判为失败的统一处理，
