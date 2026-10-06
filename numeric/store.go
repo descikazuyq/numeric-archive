@@ -48,6 +48,13 @@ type Store struct {
 	nextID uint64
 	closed bool
 
+	// occupiedNames 记录归档目录中每份正式记录文件实际占用的文件名（不含目录）
+	// 及其归属作业号。恢复出的作业保留读入时的文件名——它可能恰好是另一个
+	// （尚未分配的）作业号的默认命名；新提交按默认命名写入前必须据此确认目标
+	// 文件不属于另一作业，否则拒绝提交而不是覆盖旧记录。新接受的作业写入默认
+	// 命名后同样登记进来，使该映射始终等于目录内正式记录文件的真实占用情况。
+	occupiedNames map[string]uint64
+
 	now func() time.Time
 
 	runningID uint64
@@ -89,24 +96,27 @@ type Store struct {
 // 恢复出的记录保持读入时的正式文件名：读取规则接受任何 job- 开头、.json
 // 结尾的合法记录，作业号由记录内容识别，因此恢复改写与后续状态更新（运行、
 // 完成、失败、取消）都写回同一份文件，不按默认命名另写一份而同号旧记录
-// 原样保留；原文件无法替换时返回实际保存错误，不转到另一文件。
+// 原样保留；原文件无法替换时返回实际保存错误，不转到另一文件。若某份恢复
+// 记录的文件名恰好等于下一个新作业将使用的默认文件名，新提交会被拒绝
+// （[ErrFileNameOccupied]）而不是覆盖该记录，直到调用方改名解除冲突。
 func Open(dir string, opts ...Option) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	jobs, maxID, err := loadDir(dir)
+	jobs, maxID, occupiedNames, err := loadDir(dir)
 	if err != nil {
 		return nil, err
 	}
 	s := &Store{
-		dir:    dir,
-		jobs:   jobs,
-		byID:   make(map[uint64]*storedJob),
-		idem:   make(map[idemIdentity]uint64),
-		nextID: maxID + 1,
-		now:    wallClock{}.Now,
-		waitCh: make(chan struct{}, 1),
-		stopCh: make(chan struct{}),
+		dir:           dir,
+		jobs:          jobs,
+		byID:          make(map[uint64]*storedJob),
+		idem:          make(map[idemIdentity]uint64),
+		nextID:        maxID + 1,
+		occupiedNames: occupiedNames,
+		now:           wallClock{}.Now,
+		waitCh:        make(chan struct{}, 1),
+		stopCh:        make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -184,6 +194,15 @@ func (s *Store) Close() error {
 //
 // 未命中已接受请求的新请求（提交人不同、请求号不同或请求号为空）引用不存在
 // 的依赖时返回 [ErrDependencyNotFound]；上述拒绝都不产生记录，也不占用请求号。
+// 新作业按默认命名 job-<作业号>.json 落盘，而恢复出的旧记录允许使用合法的
+// 非默认文件名（作业号由记录内容识别）并继续写回原文件：当某份旧记录的
+// 文件名恰好等于拟分配作业号的默认文件名时，返回 [ErrFileNameOccupied]——
+// 错误给出拟分配的新作业号、被占用的文件名与原归属作业号。该拒绝不产生新
+// 作业、不进入计算队列、不消耗作业号、不登记请求号，也不改动占用该名称的
+// 旧记录（其即使已失败或取消仍占用文件名；只按记录内容识别作业号，不看
+// 文件名中的数字）。这项文件名检查只作用于需要创建记录的新请求，位于幂等
+// 判定与上游存在性校验之后：命中已接受请求号时，相同内容仍返回原作业当前
+// 详情、内容不同仍返回原有的 [ErrIdempotencyConflict]，空请求号仍按新请求处理。
 // 相同提交人+请求号+内容的重复提交（含并发重复）返回原作业及其当前状态。
 func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	s.mu.Lock()
@@ -224,6 +243,14 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	if err := s.validateDependenciesExistLocked(deps); err != nil {
 		return nil, err
 	}
+	// 新作业按默认命名写入，但目录中可能有一份恢复出的旧记录（作业号由记录
+	// 内容识别，文件名是合法的非默认命名）恰好占用了这个文件名。直接写入会
+	// 覆盖属于另一作业的已保存记录，因此拒绝本次请求。该校验只作用于需要
+	// 创建记录的新请求：上面的幂等重放/冲突不写文件，早已返回；旧记录即使
+	// 已失败或取消仍占用其文件名，文件名里的数字也不能替代记录中的真实作业号。
+	if err := s.validateDefaultFileNameFreeLocked(); err != nil {
+		return nil, err
+	}
 
 	now := s.now().UTC()
 	j := &storedJob{
@@ -243,6 +270,9 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	s.nextID++
 	s.jobs = append(s.jobs, j)
 	s.byID[j.id] = j
+	// 新作业按默认命名落盘，登记该文件的归属；恢复出的旧记录不会使用默认
+	// 命名（否则上面的校验已拒绝本次提交），故这里登记的键此前不存在。
+	s.occupiedNames[recordFileName(j)] = j.id
 	if req.RequestID != "" {
 		s.idem[idemIdentity{req.Submitter, req.RequestID}] = j.id
 	}
@@ -297,6 +327,28 @@ func (s *Store) validateDependenciesExistLocked(deps []uint64) error {
 		if s.byID[id] == nil {
 			return fmt.Errorf("%w：作业号 %d", ErrDependencyNotFound, id)
 		}
+	}
+	return nil
+}
+
+// validateDefaultFileNameFreeLocked 校验拟分配作业号 s.nextID 的默认记录
+// 文件没有被一份恢复出的旧记录占用。读取功能按记录内容识别作业号，允许
+// 合法记录使用不同于默认命名的文件名并在状态更新时写回原文件；若这份文件
+// 名恰好等于新作业将使用的默认命名，直接写入会覆盖属于另一作业的已保存
+// 记录，因此拒绝新请求。
+//
+// 拒绝不产生新作业、不进入计算队列、不消耗作业号、不登记提交人的请求号，
+// 也不移动、删除、重命名或改写占用该名称的旧记录：旧作业的参数、状态与
+// 已有结果继续按原有文件名读取与保存。旧记录即使已失败或取消也不释放其
+// 文件名；只按实际文件名判断，不拿文件名中的数字充当记录中的真实作业号。
+// 错误明确给出拟分配的新作业号、被占用的文件名与该文件原归属的作业号。
+func (s *Store) validateDefaultFileNameFreeLocked() error {
+	name := jobFileName(s.nextID)
+	if owner, occupied := s.occupiedNames[name]; occupied {
+		return fmt.Errorf("%w：拟分配的新作业号为 %d，其默认记录文件 %s 已属于另一作业 %d；"+
+			"拒绝提交以避免覆盖该作业的已保存记录，未产生新作业、未消耗作业号、未登记请求号，"+
+			"也不改动该文件；请先处理占用文件（如改名）后重试",
+			ErrFileNameOccupied, s.nextID, name, owner)
 	}
 	return nil
 }

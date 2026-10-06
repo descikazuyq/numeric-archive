@@ -284,10 +284,10 @@ func syncDir(dir string) {
 //     空数组）也直接判失败（BlockerID 为 0）——提交时即拒绝空序列，恢复时
 //     不能凭已有实际输入或成功上游的总和补出原始参数后继续计算。仍在排队
 //     的其他作业在同一趟升序扫描中按既有依赖规则级联失败。
-func loadDir(dir string) ([]*storedJob, uint64, error) {
+func loadDir(dir string) ([]*storedJob, uint64, map[string]uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	// 第一阶段：只读解析全部记录文件，不进行任何恢复改写。这样重复作业号与
 	// 请求号唯一性检查可以在第一条记录被改判失败或补写结果之前作出判断：一个
@@ -318,7 +318,7 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		}
 		j, err := parseJobRecord(dir, name)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, nil, err
 		}
 		parsed = append(parsed, parsedRecord{name: name, job: j})
 		if j.id > maxID {
@@ -338,7 +338,7 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	for i := range parsed {
 		rec := &parsed[i]
 		if prev, dup := seen[rec.job.id]; dup {
-			return nil, 0, duplicateJobIDError(rec.job.id, prev.name, rec.name)
+			return nil, 0, nil, duplicateJobIDError(rec.job.id, prev.name, rec.name)
 		}
 		seen[rec.job.id] = rec
 	}
@@ -365,7 +365,7 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		}
 		key := idemIdentity{rec.job.submitter, rec.job.requestID}
 		if prev, dup := idemSeen[key]; dup {
-			return nil, 0, duplicateRequestIDError(rec.job.submitter, rec.job.requestID,
+			return nil, 0, nil, duplicateRequestIDError(rec.job.submitter, rec.job.requestID,
 				prev.id, prev.name, rec.job.id, rec.name)
 		}
 		idemSeen[key] = &idemSeenEntry{id: rec.job.id, name: rec.name}
@@ -527,7 +527,17 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			failRestoredJob(dir, j, blockedFailureReason(runtimeBlockedHead(direct), direct, directID, root), root)
 		}
 	}
-	return jobs, maxID, nil
+	// occupiedNames 记录目录中每份正式记录文件实际占用的文件名及其归属作业号。
+	// 恢复出的作业保留读入时的文件名（可能是合法的非默认命名，作业号由记录
+	// 内容识别），而新提交仍按默认命名 jobFileName(新作业号) 写入：当某份旧
+	// 记录的文件名恰好等于下一个新作业的默认文件名时，若直接写入就会覆盖那份
+	// 属于另一作业的已保存记录。目录内文件名天然唯一，重复作业号检查又已保证
+	// 每份记录只出现一次，因此这里不存在键冲突；提交路径据此拒绝新请求。
+	occupiedNames := make(map[string]uint64, len(jobs))
+	for _, j := range jobs {
+		occupiedNames[j.fileName] = j.id
+	}
+	return jobs, maxID, occupiedNames, nil
 }
 
 // parseJobRecord 只读解析单个作业记录文件并构造内存中的恢复作业，不执行任何
