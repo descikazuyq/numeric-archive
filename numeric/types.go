@@ -68,6 +68,13 @@ var (
 	ErrInvalidTimeRange = errors.New("numeric: 查询时间范围无效，起始时间晚于结束时间")
 	// ErrStoreClosed 表示归档已关闭，不再接受操作。
 	ErrStoreClosed = errors.New("numeric: 归档已关闭")
+	// ErrJobIDExhausted 表示作业号空间（uint64）已耗尽：已接受作业的最大编号
+	// 达到上限，没有剩余编号可分配给新作业。该拒绝只针对需要创建记录的新
+	// 请求，不产生记录、不进入计算队列、不登记请求号；幂等重放与幂等冲突
+	// 仍按原规则返回原作业，不被此错误替代。编号只增不补：已接受作业后来
+	// 失败或取消不释放编号，较小编号上的空缺也不会被回头填补，作业号 0
+	// 永远不会成为新作业的编号。
+	ErrJobIDExhausted = errors.New("numeric: 作业号已耗尽，无法分配新作业号，拒绝提交")
 )
 
 // SubmitRequest 是一次作业提交的原始参数。

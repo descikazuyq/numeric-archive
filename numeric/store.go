@@ -2,6 +2,7 @@ package numeric
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -55,7 +56,13 @@ type Store struct {
 	// 新作业又只使用各自的默认文件名，因此运行期间无需增删。
 	fileNameOwner map[string]uint64
 	nextID        uint64
-	closed        bool
+	// idsExhausted 为 true 表示作业号空间已耗尽：已接受作业的最大编号达到
+	// uint64 上限，nextID 回绕后的值（含 0）不再作为可用编号。此时归档本身
+	// 完全可用（查询、列举、取消、幂等重放照常），只有需要创建记录的新请求
+	// 会被 [ErrJobIDExhausted] 拒绝。编号只向前分配：已接受作业后来失败或
+	// 取消不释放编号，较小编号上的空缺也不回头填补。
+	idsExhausted bool
+	closed       bool
 
 	now func() time.Time
 
@@ -95,6 +102,10 @@ type Store struct {
 //   - 排队作业继续排队并由本地唯一 worker 按提交先后处理；
 //   - 成功状态始终与完整归档同时可见。
 //
+// 已接受作业的最大编号达到 uint64 上限的归档仍可正常打开：已有作业按
+// 原规则查询、列举与处理，只是编号空间已耗尽，[Store.Submit] 对需要创建
+// 记录的新请求返回 [ErrJobIDExhausted]（幂等重放与冲突不受影响）。
+//
 // 恢复出的记录保持读入时的正式文件名：读取规则接受任何 job- 开头、.json
 // 结尾的合法记录，作业号由记录内容识别，因此恢复改写与后续状态更新（运行、
 // 完成、失败、取消）都写回同一份文件，不按默认命名另写一份而同号旧记录
@@ -116,9 +127,13 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		idem:          make(map[idemIdentity]uint64),
 		fileNameOwner: make(map[string]uint64),
 		nextID:        maxID + 1,
-		now:           wallClock{}.Now,
-		waitCh:        make(chan struct{}, 1),
-		stopCh:        make(chan struct{}),
+		// 最大编号已抵上限时，maxID+1 回绕为 0，而 0 以及任何回绕后的数字都
+		// 不是可用编号：归档照常打开（已有作业的查询、列举与处理不受影响），
+		// 仅新请求的提交被 ErrJobIDExhausted 拒绝。
+		idsExhausted: maxID == math.MaxUint64,
+		now:          wallClock{}.Now,
+		waitCh:       make(chan struct{}, 1),
+		stopCh:       make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -223,6 +238,18 @@ func (s *Store) Close() error {
 // 请求号命中已接受作业时，内容相同仍返回原作业的当前详情，内容不同仍返回
 // 原有的幂等冲突，不会被文件名占用错误替代；空请求号继续按新请求处理。
 //
+// 作业号按接受先后从 uint64 空间递增分配。已接受作业的最大编号达到上限
+// （18446744073709551615）后，编号空间耗尽：需要创建记录的新请求返回空作业
+// 与 [ErrJobIDExhausted]，不产生记录、不进入计算队列、不登记请求号，按作业号
+// 查询与按提交人列举都看不到它，已有作业的参数、状态与成功归档也不被改写。
+// 回绕得到的 0 或任何更小的数字都不会被当作可用编号，较小编号上的空缺也不
+// 回头填补；已接受作业后来失败或取消不释放编号。还剩最后一个编号时，合法的
+// 新请求正常取得该最大编号并按既有规则计算与归档，只有这次提交被确认保存和
+// 接受之后，后续新提交才被拒绝；若该次提交保存失败，返回实际保存错误且不接受
+// 作业，写入恢复后重新提交仍取得同一个最后编号。编号耗尽只限制创建新作业：
+// 相同提交人用已有的非空请求号提交相同内容仍返回原作业的当前详情，内容不同
+// 仍返回 [ErrIdempotencyConflict]，不会被编号耗尽错误替代。
+//
 // 相同提交人+请求号+内容的重复提交（含并发重复）返回原作业及其当前状态。
 func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	s.mu.Lock()
@@ -263,6 +290,16 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	if err := s.validateDependenciesExistLocked(deps); err != nil {
 		return nil, err
 	}
+	// 作业号空间已耗尽：已接受作业的最大编号达到 uint64 上限，没有剩余编号
+	// 可分配。拒绝只针对需要创建记录的新请求——上面的幂等重放/冲突分支不受
+	// 影响，仍返回原作业。拒绝返回空作业，不产生记录、不进入计算队列、不
+	// 登记请求号，查询与列举都看不到这次请求。编号只增不补：即使较小编号
+	// 没有记录也不回头补号，回绕得到的 0 或任何更小的数字都不能作为新作业
+	// 的编号。
+	if s.idsExhausted {
+		return nil, fmt.Errorf("%w：已接受作业的最大编号 %d 已达上限，没有剩余编号可分配给新作业",
+			ErrJobIDExhausted, uint64(math.MaxUint64))
+	}
 	// 新作业将按默认命名 jobFileName(nextID) 落盘。该文件若是另一份恢复作业
 	// 的正式文件（作业号由记录内容识别，非默认文件名中的数字可以与真实作业号
 	// 不同），按默认命名写入会原子替换掉那份属于其他作业号的已保存记录，因此
@@ -289,6 +326,12 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 		return nil, err
 	}
 	s.nextID++
+	if j.id == math.MaxUint64 {
+		// 本次提交已确认保存并接受了最后一个可用编号：此后新请求进入编号
+		// 耗尽的拒绝行为。保存失败时不会走到这里，写入恢复后重新提交仍能
+		// 取得同一个最后编号；该作业后来失败或取消也不释放这个编号。
+		s.idsExhausted = true
+	}
 	s.jobs = append(s.jobs, j)
 	s.byID[j.id] = j
 	if req.RequestID != "" {
