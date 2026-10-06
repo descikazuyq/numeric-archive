@@ -88,6 +88,13 @@ type storedJob struct {
 	values       []int64
 	dependencies []uint64 // 有序直接上游作业号；空表示无依赖
 
+	// fileName 是这份作业记录所在的文件名（目录内，不含路径）。读取规则接受
+	// 任何以 job- 开头、以 .json 结尾的记录文件，作业身份由记录内容中的
+	// 作业号决定而非文件名；因此状态更新必须写回这同一份文件，不能按默认
+	// 命名另写一份——否则原文件仍保留旧状态，下次打开会出现同号副本。
+	// 新提交的作业使用默认命名 jobFileName(id)。
+	fileName string
+
 	queuedAt   time.Time
 	startedAt  time.Time
 	finishedAt time.Time
@@ -141,7 +148,17 @@ func jobFileName(id uint64) string {
 }
 
 func (s *Store) jobPath(j *storedJob) string {
-	return filepath.Join(s.dir, jobFileName(j.id))
+	return filepath.Join(s.dir, recordFileName(j))
+}
+
+// recordFileName 返回这条作业记录应当写入的文件名：恢复出的记录写回原来
+// 被读取的那份文件（即使名称带额外后缀、不同于默认命名），新提交的记录
+// 使用默认命名。fileName 为空时按默认名兜底，行为与旧代码一致。
+func recordFileName(j *storedJob) string {
+	if j.fileName != "" {
+		return j.fileName
+	}
+	return jobFileName(j.id)
 }
 
 func encodeRecord(j *storedJob) ([]byte, error) {
@@ -184,7 +201,9 @@ func (s *Store) persist(j *storedJob) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(s.dir, jobFileName(j.id), data, 0o600)
+	// 写回这条记录自己的文件：从非默认名文件恢复的记录也写回原文件，
+	// 保证更新是原子替换原记录，而不是按作业号另写一份造成同号副本。
+	return writeFileAtomic(s.dir, recordFileName(j), data, 0o600)
 }
 
 // writeFileAtomic 将 data 写入 dir/name：同目录临时文件 → fsync → rename
@@ -566,6 +585,9 @@ func parseJobRecord(dir, name string) (*storedJob, error) {
 		seed:         r.Seed,
 		values:       append([]int64(nil), r.Values...),
 		dependencies: deps,
+		// 记住这条记录来自哪份文件：之后的状态更新（运行、完成、失败、
+		// 取消与恢复改判）都写回这份原文件，不按默认命名另写新文件。
+		fileName: name,
 
 		queuedAt:   r.QueuedAt,
 		startedAt:  r.StartedAt,
@@ -641,7 +663,8 @@ func failRestoredJob(dir string, j *storedJob, reason string, blocker uint64) {
 	j.effectiveValues = nil
 	j.archive = nil
 	if data, err := encodeRecord(j); err == nil {
-		_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
+		// 写回这条记录自己的文件（恢复时记录的原文件名），不另写默认名文件。
+		_ = writeFileAtomic(dir, recordFileName(j), data, 0o600)
 	}
 }
 

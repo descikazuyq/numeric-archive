@@ -230,6 +230,8 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 		dependencies: append([]uint64(nil), deps...),
 		queuedAt:     now,
 		status:       StatusQueued,
+		// 新提交的记录使用默认命名；恢复出的记录保留各自的原文件名。
+		fileName: jobFileName(s.nextID),
 	}
 	// 先持久化，接受之后该提交即不可丢失。
 	if err := s.persist(j); err != nil {
