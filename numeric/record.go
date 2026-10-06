@@ -243,6 +243,12 @@ func syncDir(dir string) {
 //     的成功记录、排队记录等全部保持原样）；不按时间、状态、排列或完整度
 //     挑选一份，也不自动换号、合并或删除，调用方处理冲突后再次打开才按
 //     既有规则恢复；
+//   - 两份作业号不同的记录保存了相同提交人与同一个非空请求号时（提交功能
+//     保证不会出现的形态），同样在恢复改写之前直接失败，返回说明提交人、
+//     请求号、两个冲突作业号与冲突文件名的非空错误；标识按恢复后的完整
+//     字节比较（含 U+0000 与非法 UTF-8），空请求号不启用幂等因此豁免，
+//     不同提交人使用相同请求号也合法。冲突时同样不启动计算、不改写任何
+//     原有记录，不因记录状态（含已失败/取消）、提交时间或文件排列挑选一条；
 //   - 上次关闭时仍为 running 的作业标记为失败，原因是计算被中断；
 //   - 成功记录缺少归档、校验值对不上，依赖列表重复引用同一直接上游作业号，
 //     或直接上游作业号不小于本作业号（引用自己或后来作业，违反提交时的
@@ -265,12 +271,14 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	// 第一阶段：只读解析全部记录文件，不进行任何恢复改写。这样重复作业号
-	// 检查可以在第一条记录被改判失败或补写结果之前作出判断：一个稳定作业号
-	// 只能对应一份已保存作业，两份顶层作业号相同的记录（文件名不同、内容
-	// 完全相同也不例外）必须让本次打开整体失败，而不是按文件排列、时间或
-	// 状态挑一份继续，也不能先按正常恢复规则把其他作业改判失败/补写结果再
-	// 报错——冲突时本次打开不启动任何计算，也不改写目录内任何原有记录。
+	// 第一阶段：只读解析全部记录文件，不进行任何恢复改写。这样重复作业号与
+	// 请求号唯一性检查可以在第一条记录被改判失败或补写结果之前作出判断：一个
+	// 稳定作业号只能对应一份已保存作业，同一提交人的非空请求号也只能对应一个
+	// 作业；两份顶层作业号相同的记录（文件名不同、内容完全相同也不例外），或
+	// 两份不同作业号却保存相同提交人+非空请求号的记录，必须让本次打开整体
+	// 失败，而不是按文件排列、时间或状态挑一份继续，也不能先按正常恢复规则把
+	// 其他作业改判失败/补写结果再报错——冲突时本次打开不启动任何计算，也不
+	// 改写目录内任何原有记录。
 	type parsedRecord struct {
 		name string
 		job  *storedJob
@@ -306,6 +314,8 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	// 作业号以及全部冲突记录的文件名（至少两份），便于调用方定位。不按
 	// 提交时间、状态、排列或哪份带完整结果挑选，也不自动换号、合并参数或
 	// 删除冲突文件；调用方处理完冲突后再次打开才按既有规则恢复。
+	// 紧随其后的请求号唯一性检查遵守同一条“失败即整次打开失败、不挑选、不
+	// 改写”的纪律，只是冲突键从作业号换成（提交人, 非空请求号）。
 	seen := make(map[uint64]*parsedRecord, len(parsed))
 	for i := range parsed {
 		rec := &parsed[i]
@@ -315,12 +325,41 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		seen[rec.job.id] = rec
 	}
 
+	// 请求号唯一性检查：所有记录都可正常解析、版本与状态合法、且每个作业号只
+	// 对应一份记录之后，在任何恢复改写之前执行。提交功能已保证“同一提交人的
+	// 非空请求号只能对应一个作业”，读取保存记录时必须成立同样的唯一性：两份
+	// 记录作业号不同却保存了相同提交人和同一个非空请求号（按恢复后的完整字节
+	// 逐字节比较，含 U+0000 与非法 UTF-8，后者由 identity_raw 兜底恢复）时，
+	// 本次打开整体失败，而不是让索引静默指向作业号较大的一条。空请求号不启用
+	// 幂等，同一提交人可以保存多条空请求号作业；不同提交人使用相同请求号也
+	// 合法。即使两份记录的整数序列、种子、依赖与计算结果完全相同也不能合并
+	// 成一次请求；其中一份已失败或取消也不释放请求号——检查只看恢复出的标识
+	// 与作业号，不看状态、提交时间或文件排列，也不挑一条继续使用。
+	type idemSeenEntry struct {
+		id   uint64
+		name string
+	}
+	idemSeen := make(map[idemIdentity]*idemSeenEntry, len(parsed))
+	for i := range parsed {
+		rec := &parsed[i]
+		if rec.job.requestID == "" {
+			continue
+		}
+		key := idemIdentity{rec.job.submitter, rec.job.requestID}
+		if prev, dup := idemSeen[key]; dup {
+			return nil, 0, duplicateRequestIDError(rec.job.submitter, rec.job.requestID,
+				prev.id, prev.name, rec.job.id, rec.name)
+		}
+		idemSeen[key] = &idemSeenEntry{id: rec.job.id, name: rec.name}
+	}
+
 	jobs := make([]*storedJob, 0, len(parsed))
 	for _, rec := range parsed {
 		jobs = append(jobs, rec.job)
 	}
 
-	// 第二阶段：至此目录中每个作业号只对应一份记录，下面的既有恢复规则
+	// 第二阶段：至此目录中每个作业号只对应一份记录、且每个（提交人, 非空
+	// 请求号）也只对应一个作业号，下面的既有恢复规则
 	// （中断改判、成功归档复核、排队记录自身有误与依赖失效级联）才允许
 	// 改写记录。第一趟状态修正只依赖单条记录自身，直接逐个执行即可。
 	for _, j := range jobs {
@@ -480,7 +519,8 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 // 而改变错误类型。
 //
 // running 改判与成功归档复核等会改写记录的恢复步骤不在此处进行：调用方先
-// 解析完全部记录并确认作业号无重复之后，才允许进入恢复改写阶段。
+// 解析完全部记录并确认作业号无重复、同一提交人的非空请求号也没有跨不同
+// 作业号重复之后，才允许进入恢复改写阶段。
 func parseJobRecord(dir, name string) (*storedJob, error) {
 	path := filepath.Join(dir, name)
 	data, err := os.ReadFile(path)
@@ -548,6 +588,23 @@ func duplicateJobIDError(id uint64, first, second string) error {
 	return fmt.Errorf("numeric: 归档目录存在重复作业号 %d：一个稳定作业号只能对应一份已保存作业，"+
 		"但记录文件 %s 与 %s 顶层保存了相同作业号；拒绝打开且不改动任何记录，请处理冲突文件后重试",
 		id, first, second)
+}
+
+// duplicateRequestIDError 构造请求号重复归属冲突的打开错误：两份不同作业号的
+// 记录保存了相同提交人与同一个非空请求号——这是提交功能本就保证不会出现的
+// 形态，读取保存记录时同样必须拒绝，而不能让恢复出的幂等索引静默指向作业号
+// 较大的一条。错误指出提交人、请求号以及至少两个冲突作业号与各自的记录文件名。
+//
+// 标识按恢复后的完整字节给出：%q 会把 U+0000 转义成 \x00、把非法 UTF-8
+// 字节转义成 \xff 这类字节转义（不会像直接显示那样都塌缩成替换字符 U+FFFD），
+// 再附上完整字节的十六进制，使不可见或非法字节也能唯一定位——两个显示相同
+// 但字节不同的标识不会给出无法区分的冲突信息。
+func duplicateRequestIDError(submitter, requestID string, firstID uint64, firstName string, secondID uint64, secondName string) error {
+	return fmt.Errorf("numeric: 归档目录存在重复的幂等请求号：提交人 %q（完整字节 %x）的非空请求号 %q（完整字节 %x）"+
+		"重复归属于不同作业 %d（记录文件 %s）与 %d（记录文件 %s）；同一提交人的非空请求号只能对应一个作业，"+
+		"拒绝打开且不改动任何记录，请处理冲突文件后重试",
+		submitter, []byte(submitter), requestID, []byte(requestID),
+		firstID, firstName, secondID, secondName)
 }
 
 // failRestoredJob 收拢重新打开归档时把恢复出的作业改判为失败的统一处理，
