@@ -103,6 +103,14 @@ type storedJob struct {
 	// canceled 仅存于内存：运行中的作业收到取消/关闭请求后置位，
 	// 计算循环据此尽快中止；终态不会依赖它落盘（终态本身会持久化）。
 	canceled atomic.Bool
+
+	// fileName 是该作业记录在归档目录中的正式文件名（不含目录）。
+	// 恢复出的记录保留读入时的文件名——读取规则接受任何 job- 开头、
+	// .json 结尾的合法记录，作业号由记录内容而非文件名识别，因此状态
+	// 更新必须写回同一份文件，不能按默认命名另写一份而同号旧记录
+	// 原样保留（下次打开会因重复作业号拒绝打开）。新提交的作业此字段
+	// 为空，落盘时使用默认命名 jobFileName(id)。
+	fileName string
 }
 
 // jobRecord 是 storedJob 的落盘 JSON 表示。成功状态与归档在同一记录内，
@@ -140,8 +148,17 @@ func jobFileName(id uint64) string {
 	return fmt.Sprintf("job-%020d.json", id)
 }
 
+// recordFileName 返回作业记录落盘使用的正式文件名：恢复出的记录写回其
+// 原有文件（文件名不必是默认命名），新提交的记录使用默认命名。
+func recordFileName(j *storedJob) string {
+	if j.fileName != "" {
+		return j.fileName
+	}
+	return jobFileName(j.id)
+}
+
 func (s *Store) jobPath(j *storedJob) string {
-	return filepath.Join(s.dir, jobFileName(j.id))
+	return filepath.Join(s.dir, recordFileName(j))
 }
 
 func encodeRecord(j *storedJob) ([]byte, error) {
@@ -172,7 +189,8 @@ func encodeRecord(j *storedJob) ([]byte, error) {
 	return json.MarshalIndent(&r, "", "  ")
 }
 
-// persist 在已持锁的情况下原子写一条作业记录。
+// persist 在已持锁的情况下原子写一条作业记录。恢复出的记录写回其原有
+// 文件：原文件无法替换时返回实际保存错误，不转到默认命名的另一份文件。
 func (s *Store) persist(j *storedJob) error {
 	// 测试用故障注入点（生产代码中 persistFault 恒为 nil）。
 	if s.persistFault != nil {
@@ -184,7 +202,7 @@ func (s *Store) persist(j *storedJob) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(s.dir, jobFileName(j.id), data, 0o600)
+	return writeFileAtomic(s.dir, recordFileName(j), data, 0o600)
 }
 
 // writeFileAtomic 将 data 写入 dir/name：同目录临时文件 → fsync → rename
@@ -521,6 +539,9 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 // running 改判与成功归档复核等会改写记录的恢复步骤不在此处进行：调用方先
 // 解析完全部记录并确认作业号无重复、同一提交人的非空请求号也没有跨不同
 // 作业号重复之后，才允许进入恢复改写阶段。
+//
+// 恢复出的作业记住读入时的文件名（name）：文件名不必是默认命名，后续任何
+// 状态更新都写回这同一份正式文件，而不是按作业号另写默认命名的记录。
 func parseJobRecord(dir, name string) (*storedJob, error) {
 	path := filepath.Join(dir, name)
 	data, err := os.ReadFile(path)
@@ -577,6 +598,9 @@ func parseJobRecord(dir, name string) (*storedJob, error) {
 
 		effectiveValues: append([]int64(nil), r.EffectiveValues...),
 		archive:         r.Archive,
+
+		// 记录读入时的正式文件名，后续状态更新写回同一份文件。
+		fileName: name,
 	}, nil
 }
 
@@ -628,9 +652,10 @@ func duplicateRequestIDError(submitter, requestID string, firstID uint64, firstN
 // 已经有完成时间的记录保留该时间，只有没有完成时间的才补上当前时间；
 // 清除成功归档与实际参与计算的输入，使按作业号读取与按提交人列举都不再返回
 // 成功归档或实际输入；作业号、提交人、请求号、原始整数次序、种子、依赖次序
-// 与已有开始时间均不在此改动。归档可正常写入时，变化经同一条记录的一次
-// 原子替换写回磁盘，而不只停留在内存查询结果中；写入失败维持既有尽力而为
-// 语义（不因恢复阶段的一次落盘失败让整个归档无法打开）。
+// 与已有开始时间均不在此改动。归档可正常写入时，变化经该作业原有记录文件的
+// 一次原子替换写回磁盘（恢复出的记录保持读入时的文件名，不按默认命名另写
+// 一份而同号旧记录原样保留），而不只停留在内存查询结果中；写入失败维持
+// 既有尽力而为语义（不因恢复阶段的一次落盘失败让整个归档无法打开）。
 func failRestoredJob(dir string, j *storedJob, reason string, blocker uint64) {
 	j.status = StatusFailed
 	j.failureReason = reason
@@ -641,7 +666,7 @@ func failRestoredJob(dir string, j *storedJob, reason string, blocker uint64) {
 	j.effectiveValues = nil
 	j.archive = nil
 	if data, err := encodeRecord(j); err == nil {
-		_ = writeFileAtomic(dir, jobFileName(j.id), data, 0o600)
+		_ = writeFileAtomic(dir, recordFileName(j), data, 0o600)
 	}
 }
 
