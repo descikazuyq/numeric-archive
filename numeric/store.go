@@ -54,8 +54,14 @@ type Store struct {
 	// 的原文件（即使关闭前由调用方改名，也只有重开归档才会重新扫描），
 	// 新作业又只使用各自的默认文件名，因此运行期间无需增删。
 	fileNameOwner map[string]uint64
-	nextID        uint64
-	closed        bool
+	// nextID 是下一个将分配给新作业的编号，按接受先后严格递增。0 是耗尽
+	// 标记而非可分配编号：当恢复出的最大作业号（或本会话最后接受的作业号）
+	// 为 math.MaxUint64 时，递增自然回绕为 0，此后新请求必须被拒绝而不是
+	// 取得编号 0——作业号 0 同样不能成为新作业的编号，较小的编号即使没有
+	// 记录也不能回头补号。首份记录保存失败的提交不会执行递增，故其拟用
+	// 编号（含最后一个编号 math.MaxUint64）在写入恢复后仍可重新取得。
+	nextID uint64
+	closed bool
 
 	now func() time.Time
 
@@ -115,10 +121,12 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		byID:          make(map[uint64]*storedJob),
 		idem:          make(map[idemIdentity]uint64),
 		fileNameOwner: make(map[string]uint64),
-		nextID:        maxID + 1,
-		now:           wallClock{}.Now,
-		waitCh:        make(chan struct{}, 1),
-		stopCh:        make(chan struct{}),
+		// 最大作业号为 math.MaxUint64 时这里自然回绕为 0：0 是耗尽标记，
+		// Submit 据此拒绝一切新请求，但归档本身照常打开、已有作业照常使用。
+		nextID: maxID + 1,
+		now:    wallClock{}.Now,
+		waitCh: make(chan struct{}, 1),
+		stopCh: make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -223,6 +231,21 @@ func (s *Store) Close() error {
 // 请求号命中已接受作业时，内容相同仍返回原作业的当前详情，内容不同仍返回
 // 原有的幂等冲突，不会被文件名占用错误替代；空请求号继续按新请求处理。
 //
+// 作业号按接受先后用 uint64 严格递增分配，不回绕、不回头补号：已接受作业的
+// 最大作业号达到 math.MaxUint64 后，任何需要创建作业的新请求都返回
+// [ErrJobIDsExhausted]（空作业），即使较小的编号没有记录、或作业号 0 从未
+// 使用也不例外——回绕会把下一个作业号变成 0，破坏唯一性与接受先后顺序并
+// 覆盖已有小编号作业的记录。这份拒绝与文件名占用拒绝一样不产生记录、不进入
+// 计算队列、不登记请求号、查询与列举都看不到该请求，也不改写已有作业；归档
+// 本身仍可正常打开，已有作业继续按原规则查询、列举、取消与处理。仅剩最后一个
+// 编号时合法的新请求照常取得 math.MaxUint64 并按既有规则计算归档，只有这次
+// 提交确认保存、接受之后，后续新提交才进入耗尽拒绝；若这次提交的首份记录
+// 保存失败，返回的是实际保存错误，编号未被消耗（nextID 不递增），写入恢复后
+// 可重新提交并取得同一个最后编号。已经接受的作业后来失败或取消不释放编号。
+// 耗尽同样只限制创建新作业，位于幂等判定之后：相同提交人用已有非空请求号
+// 提交相同内容仍返回原作业当前详情，内容不同仍返回原作业与幂等冲突，不会被
+// [ErrJobIDsExhausted] 替代；不同提交人、首次使用的请求号与空请求号仍是新请求。
+//
 // 相同提交人+请求号+内容的重复提交（含并发重复）返回原作业及其当前状态。
 func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	s.mu.Lock()
@@ -263,6 +286,14 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	if err := s.validateDependenciesExistLocked(deps); err != nil {
 		return nil, err
 	}
+	// 编号没有剩余空间时（nextID 回绕为 0），新请求在幂等判定与上游存在性
+	// 校验之后、产生任何记录之前被明确拒绝：不把回绕后的 0 当作可用编号，
+	// 也不回头补没有记录的小编号。上面的幂等重放/冲突分支不需要分配编号，
+	// 因此编号耗尽不影响已有请求号的重放与冲突语义。该检查先于默认文件名
+	// 占用检查——耗尽时根本不存在会落盘的新作业，不再有默认命名可冲突。
+	if s.nextID == 0 {
+		return nil, jobIDsExhaustedError()
+	}
 	// 新作业将按默认命名 jobFileName(nextID) 落盘。该文件若是另一份恢复作业
 	// 的正式文件（作业号由记录内容识别，非默认文件名中的数字可以与真实作业号
 	// 不同），按默认命名写入会原子替换掉那份属于其他作业号的已保存记录，因此
@@ -286,8 +317,13 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	}
 	// 先持久化，接受之后该提交即不可丢失。
 	if err := s.persist(j); err != nil {
+		// 首份记录未确认保存：作业未被接受，不执行下面的递增与登记。
+		// 因此当 j.id == math.MaxUint64（最后一个编号）时，一次保存失败
+		// 不会永久耗尽编号——写入恢复后重新提交仍取得同一个最后编号。
 		return nil, err
 	}
+	// 保存已确认：编号被正式消耗。j.id == math.MaxUint64 时递增自然回绕
+	// 为 0，此后 nextID == 0 的耗尽检查拒绝一切新请求（不把 0 当编号）。
 	s.nextID++
 	s.jobs = append(s.jobs, j)
 	s.byID[j.id] = j

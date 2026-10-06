@@ -628,6 +628,18 @@ func recordFileNameOccupiedError(newID uint64, fileName string, ownerID uint64) 
 		ErrRecordFileNameOccupied, newID, fileName, ownerID, ownerID)
 }
 
+// jobIDsExhaustedError 构造作业号耗尽时的提交拒绝错误：已接受作业的最大
+// 作业号已达到 uint64 上限 math.MaxUint64，下一个编号会回绕为 0。作业号
+// 按接受先后严格递增且 0 不能成为新作业编号，因此不能把回绕后的 0 或任何
+// 没有记录的小编号当作可用编号；这次拒绝不产生记录、不进入计算队列、不
+// 登记请求号。已有作业的查询、列举与处理以及已有请求号的幂等语义不受影响。
+func jobIDsExhaustedError() error {
+	return fmt.Errorf("%w：已接受作业的最大作业号已达到 uint64 上限 %d，"+
+		"没有剩余编号可分配；编号不会回绕，较小的未使用编号（含作业号 0）也不会回头补号，"+
+		"本次提交不产生记录",
+		ErrJobIDsExhausted, ^uint64(0))
+}
+
 // duplicateRequestIDError 构造请求号重复归属冲突的打开错误：两份不同作业号的
 // 记录保存了相同提交人与同一个非空请求号——这是提交功能本就保证不会出现的
 // 形态，读取保存记录时同样必须拒绝，而不能让恢复出的幂等索引静默指向作业号
