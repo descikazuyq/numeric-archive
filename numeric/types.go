@@ -58,6 +58,13 @@ var (
 	ErrNotCancellable = errors.New("numeric: 作业已结束，不能取消")
 	// ErrInvalidTimeRange 表示列举查询的起始时间晚于结束时间。
 	ErrInvalidTimeRange = errors.New("numeric: 查询时间范围无效，起始时间晚于结束时间")
+	// ErrDuplicateJobRecord 表示归档目录中有两份或更多记录文件在顶层保存了
+	// 同一个作业号（且这些记录都能正常解析、版本与状态合法）。稳定作业号
+	// 必须只对应一份已保存的作业：文件名不同、内容完全相同都不能被当作两个
+	// 作业或去重保留。打开在此失败且不改动目录内任何记录；调用方处理冲突
+	// （移除或改名多出的文件）后才能重新打开。错误中给出作业号与至少两份
+	// 冲突记录的文件名。
+	ErrDuplicateJobRecord = errors.New("numeric: 归档目录存在重复作业号记录，拒绝打开")
 	// ErrStoreClosed 表示归档已关闭，不再接受操作。
 	ErrStoreClosed = errors.New("numeric: 归档已关闭")
 )

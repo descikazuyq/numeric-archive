@@ -235,6 +235,14 @@ func syncDir(dir string) {
 // loadDir 扫描目录中的全部作业记录并重建内存索引。
 //
 // 恢复规则：
+//   - 目录中存在两份或更多顶层作业号相同的记录文件时，整个打开失败并返回
+//     [ErrDuplicateJobRecord]（错误含作业号与至少两份冲突记录的文件名）：
+//     稳定作业号只能对应一份已保存作业，文件名不同或内容完全相同都不能当作
+//     两个作业，也不按时间、状态、排列顺序或归档完整程度选取一份，不去重、
+//     不换号、不合并、不删除冲突文件。该检查在任何恢复改写之前完成——冲突
+//     存在时本次打开不启动任何计算，也不把运行中、成功或排队的其他记录按
+//     恢复规则改判或补写，目录内全部记录保持原样；调用方处理冲突后再次打开
+//     才按下列规则恢复；
 //   - 上次关闭时仍为 running 的作业标记为失败，原因是计算被中断；
 //   - 成功记录缺少归档、校验值对不上，依赖列表重复引用同一直接上游作业号，
 //     或直接上游作业号不小于本作业号（引用自己或后来作业，违反提交时的
@@ -252,12 +260,22 @@ func syncDir(dir string) {
 //     空数组）也直接判失败（BlockerID 为 0）——提交时即拒绝空序列，恢复时
 //     不能凭已有实际输入或成功上游的总和补出原始参数后继续计算。仍在排队
 //     的其他作业在同一趟升序扫描中按既有依赖规则级联失败。
+//
+// 整个扫描分两个阶段：第一趟只读解析全部文件（解析、版本、标识与状态
+// 合法性），不做任何可能落盘的恢复改判；待确认每个作业号只对应一份文件后，
+// 第二、三趟才执行既有恢复规则（其中改判会原子替换原记录）。这样存在重复
+// 作业号冲突时，其他记录是否排在冲突文件之前都不会被提前改写。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, 0, err
 	}
-	var jobs []*storedJob
+	// 第一趟（只读）：解析全部作业记录，不做任何恢复改写。
+	type parsedRecord struct {
+		name string // 目录内文件名，用于在重复作业号错误中指认冲突文件
+		job  *storedJob
+	}
+	var parsed []parsedRecord
 	var maxID uint64
 	for _, e := range entries {
 		name := e.Name()
@@ -328,6 +346,55 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			effectiveValues: append([]int64(nil), r.EffectiveValues...),
 			archive:         r.Archive,
 		}
+		parsed = append(parsed, parsedRecord{name: name, job: j})
+		if j.id > maxID {
+			maxID = j.id
+		}
+	}
+
+	// 作业号唯一性检查：一个稳定作业号只能对应一份已保存的作业。ReadDir
+	// 按文件名排序返回，组内文件名因此保持确定次序；错误报告作业号最小的
+	// 那组冲突并给出该组全部文件名（至少两份）。此检查必须先于一切恢复
+	// 改写——running 中断、损坏归档改判、排队复查等都可能原子替换记录，
+	// 而存在冲突时本次打开必须原样保留目录内的所有记录，且不启动计算。
+	namesByID := make(map[uint64][]string)
+	for _, p := range parsed {
+		namesByID[p.job.id] = append(namesByID[p.job.id], p.name)
+	}
+	var dupID uint64
+	var dupNames []string
+	for id, names := range namesByID {
+		if len(names) < 2 {
+			continue
+		}
+		if dupID == 0 || id < dupID {
+			dupID = id
+			dupNames = names
+		}
+	}
+	if dupID != 0 {
+		return nil, 0, fmt.Errorf(
+			"%w：作业号 %d 同时保存在 %d 份记录文件中（%s）；一个作业号只能对应一份已保存作业，"+
+				"请移除或改名多出的冲突文件后再打开，归档不会自动选取、去重、换号、合并或删除",
+			ErrDuplicateJobRecord, dupID, len(dupNames), strings.Join(dupNames, "、"))
+	}
+
+	jobs := make([]*storedJob, 0, len(parsed))
+	for _, p := range parsed {
+		jobs = append(jobs, p.job)
+	}
+	// 恢复后的排列必须与关闭前的接受先后一致：作业号在接受时单调分配，
+	// 按作业号升序即提交先后。记录上的提交时间只用于时间范围过滤，
+	// 不参与排序——本机时钟回拨会让后接受的作业带有更早的时间，
+	// 按时间重排会改变已确定的先后关系（也会让上游作业号更大的
+	// 依赖链在单趟级联扫描中漏掉失败传播）。
+	sort.Slice(jobs, func(a, b int) bool {
+		return jobs[a].id < jobs[b].id
+	})
+
+	// 第二趟：每份记录各自的恢复改判（可能原子替换原记录）。此时唯一的
+	// 作业号已保证一一对应，下面的规则才允许落盘。
+	for _, j := range jobs {
 		if j.status == StatusRunning {
 			failRestoredJob(dir, j, "计算被中断：归档上次关闭时作业仍在运行", 0)
 		}
@@ -357,7 +424,7 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			//     输入复算才能识别。
 			// 任一不符合都按损坏归档处理。第四条规则——追加部分逐项等于各
 			// 直接上游恢复后的总和——需要全部记录恢复完毕才能核对，
-			// 在排序后的第二趟扫描中执行。
+			// 在排序后的第三趟扫描中执行。
 			var invalidReason string
 			if dupID, dup := duplicateDependency(j); dup {
 				invalidReason = duplicateDependencyReason(dupID)
@@ -375,20 +442,9 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 				failRestoredJob(dir, j, invalidReason, 0)
 			}
 		}
-		jobs = append(jobs, j)
-		if j.id > maxID {
-			maxID = j.id
-		}
 	}
-	// 恢复后的排列必须与关闭前的接受先后一致：作业号在接受时单调分配，
-	// 按作业号升序即提交先后。记录上的提交时间只用于时间范围过滤，
-	// 不参与排序——本机时钟回拨会让后接受的作业带有更早的时间，
-	// 按时间重排会改变已确定的先后关系（也会让上游作业号更大的
-	// 依赖链在单趟级联扫描中漏掉失败传播）。
-	sort.Slice(jobs, func(a, b int) bool {
-		return jobs[a].id < jobs[b].id
-	})
-	// 第二趟：按作业号升序单趟处理依赖失效。直接上游在提交时必须已存在，
+
+	// 第三趟：按作业号升序单趟处理依赖失效。直接上游在提交时必须已存在，
 	// 上游作业号必然更小，因此每个作业被处理时其全部直接上游都已是本次恢复
 	// 确定的最终状态——上游被改判失败时携带的根因作业号可直接沿链条继承，
 	// 不会在每经过一个已归档的中间作业时重新起算。
@@ -483,20 +539,24 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 
 // failRestoredJob 收拢重新打开归档时把恢复出的作业改判为失败的统一处理，
 // 供六类恢复失败共用（调用顺序即各类判定的既有先后）：
-//   - 上次关闭时仍在运行的作业：计算被中断（第一趟记录扫描）；
+//   - 上次关闭时仍在运行的作业：计算被中断（第二趟记录扫描）；
 //   - 原标为成功、但归档完整性、依赖列表唯一性或先后关系、实际输入对应
-//     关系或数值结果不符规则的作业：本作业自身归档校验失败（第一趟记录
+//     关系或数值结果不符规则的作业：本作业自身归档校验失败（第二趟记录
 //     扫描，BlockerID 恒 0；唯一性检查先于先后关系检查）；
-//   - 排队记录的依赖列表重复引用同一作业号：本作业记录自身有误（第二趟升序
+//   - 排队记录的依赖列表重复引用同一作业号：本作业记录自身有误（第三趟升序
 //     扫描，BlockerID 恒 0，先于上游可用性判断）；
 //   - 排队记录引用作业号不小于自己的作业（自己/后来作业）：本作业记录自身
-//     有误（第二趟升序扫描，BlockerID 恒 0，在重复检查之后、空序列检查与
+//     有误（第三趟升序扫描，BlockerID 恒 0，在重复检查之后、空序列检查与
 //     上游可用性判断之前）；
 //   - 排队记录的原始整数序列为空（缺省、null 或空数组）：本作业记录自身
-//     有误（第二趟升序扫描，BlockerID 恒 0，在依赖列表自身合法性检查之后、
+//     有误（第三趟升序扫描，BlockerID 恒 0，在依赖列表自身合法性检查之后、
 //     上游可用性判断之前）；
-//   - 被不可用直接上游阻断的作业：成功记录复核与排队记录复查（第二趟升序扫描），
+//   - 被不可用直接上游阻断的作业：成功记录复核与排队记录复查（第三趟升序扫描），
 //     BlockerID 由调用方按 blocker.go 的归因规则给出。
+//
+// 这些改判只可能发生在 loadDir 第一趟只读解析与作业号唯一性检查通过之后：
+// 若目录中存在同一作业号的多份记录文件，本次打开在任何回写之前即失败，
+// 不会执行到本函数，目录内的记录全部原样保留。
 //
 // 处理内容与各处原先内联的步骤完全一致：置失败状态、失败原因与阻断根因；
 // 已经有完成时间的记录保留该时间，只有没有完成时间的才补上当前时间；
