@@ -48,6 +48,14 @@ var (
 	ErrNotFound = errors.New("numeric: 作业不存在")
 	// ErrDependencyNotFound 表示提交引用了不存在的依赖作业，提交被拒绝且不产生记录。
 	ErrDependencyNotFound = errors.New("numeric: 依赖作业不存在，拒绝提交")
+	// ErrRecordFileNameOccupied 表示新作业按默认命名应使用的记录文件名已经是
+	// 另一份已恢复作业的正式文件——该作业恢复自一个合法但非默认命名的记录
+	// （作业号由记录内容识别，可能与文件名中的数字不同），后续状态更新都写回
+	// 原文件。若让新作业按默认命名落盘，原子替换会覆盖那份属于其他作业号的
+	// 已保存记录，因此提交被拒绝且不产生记录。占用文件的旧记录即使已失败或
+	// 取消也不是可覆盖的空位；是否冲突只按记录中的真实作业号判断，文件名中
+	// 的数字不能替代。
+	ErrRecordFileNameOccupied = errors.New("numeric: 新作业的默认记录文件已被另一作业占用，拒绝提交")
 	// ErrInvalidDependency 表示提交的依赖列表不合法：含有零或重复作业号，
 	// 或与单依赖方式同时填写了非空列表；该提交被拒绝且不产生记录。
 	ErrInvalidDependency = errors.New("numeric: 依赖列表不合法，拒绝提交")

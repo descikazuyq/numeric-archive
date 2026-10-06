@@ -614,6 +614,20 @@ func duplicateJobIDError(id uint64, first, second string) error {
 		id, first, second)
 }
 
+// recordFileNameOccupiedError 构造提交时的默认文件名占用错误：拟分配作业号
+// newID 的新作业按默认命名应写入 fileName，但该文件已是另一份已恢复作业
+// ownerID 的正式文件——恢复规则接受 job- 开头、.json 结尾的合法记录，作业
+// 号由记录内容识别，文件名中的数字不能替代真实作业号。若按默认命名落盘，
+// 原子替换会覆盖 ownerID 的已保存记录，因此拒绝提交。错误明确给出拟分配的
+// 新作业号、被占用的文件名与文件的原归属作业号，让调用方能够定位冲突；
+// 旧记录处于失败或取消状态也同样占用该文件名。
+func recordFileNameOccupiedError(newID uint64, fileName string, ownerID uint64) error {
+	return fmt.Errorf("%w：拟分配的新作业号为 %d，其默认记录文件 %s 已属于另一作业 %d；"+
+		"为避免覆盖作业 %d 的已保存记录，本次提交被拒绝且不占用作业号，"+
+		"请处理（重命名）占用该文件名的记录后重试",
+		ErrRecordFileNameOccupied, newID, fileName, ownerID, ownerID)
+}
+
 // duplicateRequestIDError 构造请求号重复归属冲突的打开错误：两份不同作业号的
 // 记录保存了相同提交人与同一个非空请求号——这是提交功能本就保证不会出现的
 // 形态，读取保存记录时同样必须拒绝，而不能让恢复出的幂等索引静默指向作业号

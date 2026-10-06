@@ -41,12 +41,21 @@ type idemIdentity struct {
 type Store struct {
 	dir string
 
-	mu     sync.Mutex
-	jobs   []*storedJob // 严格按作业号（即提交先后）排列
-	byID   map[uint64]*storedJob
-	idem   map[idemIdentity]uint64 // (提交人, 请求号) -> 作业号
-	nextID uint64
-	closed bool
+	mu   sync.Mutex
+	jobs []*storedJob // 严格按作业号（即提交先后）排列
+	byID map[uint64]*storedJob
+	idem map[idemIdentity]uint64 // (提交人, 请求号) -> 作业号
+	// fileNameOwner 记录每个已被占用的正式记录文件名（不含目录）当前归属的
+	// 作业号，只登记恢复出的记录使用的非默认文件名：新提交的作业直接使用
+	// jobFileName(id)，而该默认文件在提交时尚不存在，不登记自己。提交新作业
+	// 前据此发现“拟用默认文件名恰好是另一份已恢复作业的正式文件”的情形，
+	// 避免默认命名落盘时原子替换掉属于其他作业号的已保存记录。
+	// 该映射在 Open 时按恢复结果建立，之后不再变化——旧记录始终写回读入时
+	// 的原文件（即使关闭前由调用方改名，也只有重开归档才会重新扫描），
+	// 新作业又只使用各自的默认文件名，因此运行期间无需增删。
+	fileNameOwner map[string]uint64
+	nextID        uint64
+	closed        bool
 
 	now func() time.Time
 
@@ -89,7 +98,9 @@ type Store struct {
 // 恢复出的记录保持读入时的正式文件名：读取规则接受任何 job- 开头、.json
 // 结尾的合法记录，作业号由记录内容识别，因此恢复改写与后续状态更新（运行、
 // 完成、失败、取消）都写回同一份文件，不按默认命名另写一份而同号旧记录
-// 原样保留；原文件无法替换时返回实际保存错误，不转到另一文件。
+// 原样保留；原文件无法替换时返回实际保存错误，不转到另一文件。若某条恢复
+// 记录的文件名恰好等于新作业将使用的默认文件名，[Store.Submit] 会拒绝该新
+// 请求（见 [ErrRecordFileNameOccupied]），不会让默认命名落盘覆盖这份记录。
 func Open(dir string, opts ...Option) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -99,14 +110,15 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		dir:    dir,
-		jobs:   jobs,
-		byID:   make(map[uint64]*storedJob),
-		idem:   make(map[idemIdentity]uint64),
-		nextID: maxID + 1,
-		now:    wallClock{}.Now,
-		waitCh: make(chan struct{}, 1),
-		stopCh: make(chan struct{}),
+		dir:           dir,
+		jobs:          jobs,
+		byID:          make(map[uint64]*storedJob),
+		idem:          make(map[idemIdentity]uint64),
+		fileNameOwner: make(map[string]uint64),
+		nextID:        maxID + 1,
+		now:           wallClock{}.Now,
+		waitCh:        make(chan struct{}, 1),
+		stopCh:        make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -117,6 +129,15 @@ func Open(dir string, opts ...Option) (*Store, error) {
 			// loadDir 已在任何恢复改写之前确认同一提交人的非空请求号不会跨
 			// 不同作业号重复，因此这里的索引恢复与提交路径遵守同一项唯一性。
 			s.idem[idemIdentity{j.submitter, j.requestID}] = j.id
+		}
+		// 只有“文件名与按记录内容识别出的作业号不一致”的恢复记录需要登记：
+		// 新作业号严格大于 maxID，新作业的默认文件名不可能与默认命名的恢复
+		// 记录重名，却可能恰好撞上某个非默认命名记录（例如目录里只有作业 1，
+		// 却保存在 job-...0002.json 中，新作业拟分配为 2）。该索引保证提交
+		// 在覆盖另一份已保存记录之前被拒绝。loadDir 已确认每个作业号只对应
+		// 一份记录，故同一正式文件名不可能同时归属两个恢复作业。
+		if name := recordFileName(j); name != jobFileName(j.id) {
+			s.fileNameOwner[name] = j.id
 		}
 	}
 	// 重建失败/取消作业对排队下游的阻断。
@@ -184,6 +205,24 @@ func (s *Store) Close() error {
 //
 // 未命中已接受请求的新请求（提交人不同、请求号不同或请求号为空）引用不存在
 // 的依赖时返回 [ErrDependencyNotFound]；上述拒绝都不产生记录，也不占用请求号。
+//
+// 新作业按默认命名（job- 前缀加补零到 20 位的作业号、.json 结尾）落盘。
+// 恢复出的记录允许使用不同于默认命名的文件名，作业号由记录内容识别；若新
+// 作业拟使用的默认文件名恰好是另一份已恢复作业的正式文件（例如目录中只有
+// 作业 1，它却保存在作业 2 的默认命名文件里，新作业拟分配为 2），提交返回
+// [ErrRecordFileNameOccupied]：错误给出拟分配的新作业号、被占用的文件名与
+// 原归属作业号。占用文件的旧记录即使已失败或取消也不是可覆盖的空位，冲突
+// 只按记录中的真实作业号判断，文件名中的数字不能替代它。这次拒绝不产生新
+// 作业、不进入计算队列、不消耗作业号、不登记请求号；按作业号查询与按提交人
+// 列举都看不到它，也不移动、删除、重命名或改写占用该名称的旧记录，旧作业
+// 的参数、状态与已有结果继续按既有规则读取与保存。关闭归档后把占用名称的
+// 旧记录改名为另一个合法且不冲突的文件名，再打开归档，此前被拒绝的请求可
+// 作为新请求接受并取得原未消耗的下一个作业号。
+//
+// 该检查只影响需要创建记录的新请求，且位于幂等判定之后：相同提交人和非空
+// 请求号命中已接受作业时，内容相同仍返回原作业的当前详情，内容不同仍返回
+// 原有的幂等冲突，不会被文件名占用错误替代；空请求号继续按新请求处理。
+//
 // 相同提交人+请求号+内容的重复提交（含并发重复）返回原作业及其当前状态。
 func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	s.mu.Lock()
@@ -223,6 +262,15 @@ func (s *Store) Submit(req SubmitRequest) (*Job, error) {
 	// 此检查必须位于幂等判定之后：上面的重放/冲突分支可能引用缺失的上游。
 	if err := s.validateDependenciesExistLocked(deps); err != nil {
 		return nil, err
+	}
+	// 新作业将按默认命名 jobFileName(nextID) 落盘。该文件若是另一份恢复作业
+	// 的正式文件（作业号由记录内容识别，非默认文件名中的数字可以与真实作业号
+	// 不同），按默认命名写入会原子替换掉那份属于其他作业号的已保存记录，因此
+	// 在产生任何记录之前拒绝。只对新请求生效：上面的幂等重放/冲突分支返回的
+	// 原作业始终写回自己的既有文件，不需要默认命名。占用文件的旧记录即使已
+	// 失败或取消也不是可覆盖的空位，是否冲突只看记录中的真实作业号。
+	if ownerID, occupied := s.fileNameOwner[jobFileName(s.nextID)]; occupied {
+		return nil, recordFileNameOccupiedError(s.nextID, jobFileName(s.nextID), ownerID)
 	}
 
 	now := s.now().UTC()
