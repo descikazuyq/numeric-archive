@@ -386,20 +386,15 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		}
 		if j.status == StatusSucceeded {
 			// 除完整性外，还必须满足三条独立的对应/复算规则：
-			//  0. 依赖列表自身合法，按以下顺序检查：
-			//     a. 同一直接上游作业号不能出现两次（相邻或隔着其他上游都算）。
-			//        这与提交时 validateDependencyShapeLocked 的唯一性要求一致；
-			//        旧版本或被改动的记录可能保存了重复引用，此时即使追加值、
-			//        总和、平方和、摘要、日志与校验值全部自洽，也不能当作合法
-			//        成功归档（重复引用会把同一上游总和追加两次）。
-			//     b. 每个直接上游作业号都必须严格小于本作业号。正常提交只能引用
-			//        已经存在的作业，作业号又按接受先后递增，所以引用自己或引用
-			//        后来作业都不可能通过提交校验；旧版本或被改动的记录可能保存
-			//        这种依赖，即使被引用作业确实存在且成功、本作业的追加值、总和、
-			//        平方和、摘要、日志与校验值全部自洽，也不能接受。已因重复
-			//        依赖判失败的记录保留重复失败说明，不再改写。
-			//     两项都属于本作业记录自身有误，在任何上游可用性核对之前判定，
-			//     BlockerID 为 0，不把被引用的有效上游判成失败。
+			//  0. 依赖列表自身合法：与排队记录复查共用同一个入口
+			//     invalidDependencyListReason（先查重复引用、再查先后关系，
+			//     规则与措辞见 blocker.go）。旧版本或被改动的记录可能保存了
+			//     重复引用或不小于本作业号的上游，此时即使追加值、总和、
+			//     平方和、摘要、日志与校验值全部自洽，也不能当作合法成功
+			//     归档（重复引用会把同一上游总和追加两次；引用自己或后来
+			//     作业不可能通过提交校验）。这属于本作业记录自身有误，在
+			//     任何上游可用性核对之前判定，BlockerID 为 0，不把被引用
+			//     的有效上游判成失败。
 			//  1. 实际输入与原始参数、直接依赖数量逐项对应——原始序列非空且
 			//     按原次序完整出现在实际输入开头，总长度恰为原始长度加上直接
 			//     依赖数；摘要、日志、校验值只与“实际输入”绑定，换成另一份
@@ -412,10 +407,8 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			// 直接上游恢复后的总和——需要全部记录恢复完毕才能核对，
 			// 在排序后的第二趟扫描中执行。
 			var invalidReason string
-			if dupID, dup := duplicateDependency(j); dup {
-				invalidReason = duplicateDependencyReason(dupID)
-			} else if badID, bad := firstIllegalOrderingDependency(j); bad {
-				invalidReason = illegalOrderingDependencyReason(badID, j.id)
+			if reason := invalidDependencyListReason(j); reason != "" {
+				invalidReason = reason
 			} else if !archiveIntact(j) {
 				invalidReason = "归档不完整或校验值不一致，成功结果不可用"
 			} else if !effectiveInputsCorrespond(j) {
@@ -462,26 +455,20 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	}
 	for _, j := range jobs {
 		if j.status == StatusQueued {
-			// 排队记录自身有误的三项检查先于一切上游可用性判断，对有无依赖的
-			// 记录同样适用（无依赖时前两项自然不命中）：
-			//  1. 依赖列表重复引用同一作业号：不能开始计算，也不能把同一上游
-			//     总和追加两次后继续。BlockerID 保持 0，不把被重复引用且原本
-			//     有效的上游改成失败。
-			//  2. 依赖先后关系不合法：直接上游作业号必须严格小于本作业号，
-			//     引用自己或后来作业即使被引用者存在且成功也不能接受，不能开始
-			//     计算或继续等待。排在重复检查之后，已因重复依赖判失败的记录
-			//     保留现有说明。
-			//  3. 原始整数序列为空（缺省、null 或空数组）：提交时即拒绝空序列，
+			// 排队记录自身有误的检查先于一切上游可用性判断，对有无依赖的
+			// 记录同样适用（无依赖时依赖列表检查自然不命中）：
+			//  1. 依赖列表自身合法：与成功归档复核共用同一个入口
+			//     invalidDependencyListReason（先查重复引用、再查先后关系，
+			//     规则与措辞见 blocker.go）。记录不合法时不能开始计算，也不
+			//     能把同一上游总和追加两次后继续；BlockerID 保持 0，不把被
+			//     引用且原本有效的上游改成失败。
+			//  2. 原始整数序列为空（缺省、null 或空数组）：提交时即拒绝空序列，
 			//     恢复时遵守同一项输入要求——不能开始运行，也不能凭已有实际输入
 			//     或成功上游的总和补出原始参数。BlockerID 保持 0。空序列指没有
 			//     任何原始整数；[0]、[0,0] 等非空序列仍是合法输入，不按总和
 			//     是否为 0 判断。
-			if dupID, dup := duplicateDependency(j); dup {
-				failRestoredJob(dir, j, duplicateDependencyReason(dupID), 0)
-				continue
-			}
-			if badID, bad := firstIllegalOrderingDependency(j); bad {
-				failRestoredJob(dir, j, illegalOrderingDependencyReason(badID, j.id), 0)
+			if reason := invalidDependencyListReason(j); reason != "" {
+				failRestoredJob(dir, j, reason, 0)
 				continue
 			}
 			if len(j.values) == 0 {
