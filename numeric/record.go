@@ -570,6 +570,15 @@ func parseJobRecord(dir, name string) (*storedJob, error) {
 		}
 		r.Archive.Submitter = aSub
 		r.Archive.RequestID = aReq
+		// 归档内的依赖表示与记录顶层共用同一换算：非空 Dependencies 列表
+		// 就是实际的有序上游列表，旧式单依赖字段的缺省、零值或残留值不能
+		// 覆盖它，也不能单独成为归档失效的理由；列表为空时才由旧式单依赖
+		// 字段推导。恢复时把归档的依赖表示统一为规范化形式——Dependencies
+		// 为实际有序列表，旧式字段继续表示是否有依赖以及列表首项，使按
+		// 作业号读取与按提交人列举返回一致的依赖信息。
+		aDeps := normalizeDependencies(r.Archive.HasDependency, r.Archive.DependencyID, r.Archive.Dependencies)
+		r.Archive.Dependencies = aDeps
+		r.Archive.HasDependency, r.Archive.DependencyID = legacyDependencyFields(aDeps)
 	}
 	switch r.Status {
 	case StatusQueued, StatusRunning, StatusSucceeded, StatusFailed, StatusCanceled:
@@ -691,16 +700,16 @@ func archiveIntact(j *storedJob) bool {
 		return false
 	}
 	// 归档中的原始参数必须与记录顶层字段一致。
-	wantHasDependency, wantDependencyID := legacyDependencyFields(j.dependencies)
 	if a.JobID != j.id || a.Submitter != j.submitter || a.RequestID != j.requestID ||
-		a.Seed != j.seed || a.HasDependency != wantHasDependency {
+		a.Seed != j.seed {
 		return false
 	}
-	if a.HasDependency && a.DependencyID != wantDependencyID {
-		return false
-	}
-	// 依赖列表（内容与次序）必须一致。旧格式归档没有 dependencies 字段，
-	// 由单依赖字段推导后再比较，与记录恢复、提交内容比较共用同一换算。
+	// 依赖内容必须一致：比较的是两处表达的实际有序上游列表——逐项、按
+	// 次序，不能只比较集合。两种写法先按 deps.go 的同一换算统一为有序
+	// 列表（非空列表优先；旧式单依赖与只含同一作业号的列表表达同一
+	// 内容），因此归档旧式单依赖字段的缺省、零值或残留值不会覆盖非空
+	// 列表，也不会单独成为归档失效的理由；但换算后两处实际列表的内容
+	// 或次序不同仍视为归档有误。
 	aDeps := normalizeDependencies(a.HasDependency, a.DependencyID, a.Dependencies)
 	if len(aDeps) != len(j.dependencies) {
 		return false
