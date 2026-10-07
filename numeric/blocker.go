@@ -32,15 +32,11 @@ import "fmt"
 // 该核对只在没有不可用上游时进行，因此“追加输入不符”与“上游不可用”同时出现
 // 时，仍归因给依赖顺序中最靠前的不可用上游。
 //
-// 依赖列表自身重复引用同一作业号（duplicateDependency）同样属于本作业记录自身
-// 有误，与上游是否有效、数值结果是否自洽无关，在任何上游可用性核对之前直接
-// 判失败，BlockerID 保持 0；被重复引用的有效上游不被改判。
-//
-// 依赖先后关系（firstIllegalOrderingDependency）也是记录自身问题：直接上游作业号
-// 必须严格小于本作业号（正常提交只能引用已存在的作业，作业号又按接受先后递增），
-// 引用自己或后来作业的记录即使数值全套自洽、被引用作业确实存在且成功，恢复时也
-// 一律改判失败，BlockerID 保持 0。已因重复依赖判失败的记录保留现有重复失败说明，
-// 不被本检查改写（重复检查先行）。
+// 依赖列表自身不合法（重复引用同一作业号、引用自己或后来接受的作业）也属于
+// 本作业记录自身有误，与上游是否有效、数值结果是否自洽无关，其唯一判断规则与
+// 失败原因统一收拢在 depvalidation.go（dependencyListFault），排队记录与成功
+// 记录共用，在任何上游可用性核对之前直接判失败，BlockerID 保持 0；被引用且
+// 原本有效的上游不被改判，两类问题同时存在时保留重复依赖的失败原因。
 //
 // 排队记录的原始整数序列为空（缺省、null 或空数组）同样是记录自身问题：提交时
 // 即拒绝空序列，恢复时也不能凭已有实际输入或成功上游的总和补出原始参数后继续
@@ -131,66 +127,6 @@ func blockedFailureReason(head string, dep *storedJob, directID, root uint64) st
 		reason += fmt.Sprintf("；阻断根因为作业 %d", root)
 	}
 	return reason
-}
-
-// duplicateDependency 按作业保存的依赖顺序找出第一个再次出现的上游作业号
-// （即该作业号第二次出现的位置；相邻重复与隔着其他上游的重复同样识别）。
-// 唯一性按作业号判断，与上游总和是否相同无关：两个不同上游都得到 3 时各
-// 引用一次并不重复。没有重复时 ok=false。
-//
-// 运行期间提交时的唯一性由 validateDependencyShapeLocked 强制；本函数只服务于
-// 重新打开归档：已保存记录的依赖列表可能绕过提交校验（旧版本写入或记录被
-// 改动），恢复时必须按与提交一致的规则拒绝重复引用。
-func duplicateDependency(j *storedJob) (id uint64, ok bool) {
-	seen := make(map[uint64]struct{}, len(j.dependencies))
-	for _, id := range j.dependencies {
-		if _, dup := seen[id]; dup {
-			return id, true
-		}
-		seen[id] = struct{}{}
-	}
-	return 0, false
-}
-
-// duplicateDependencyReason 构造“依赖列表重复”的失败原因：明确说明依赖列表
-// 重复引用，并指出首次再次出现的上游作业号。这属于本作业记录自身有误，
-// 与上游是否有效无关——即使被重复引用的上游恢复后仍成功，也不把它判成
-// 失败或归因给它，因此 BlockerID 保持 0。
-func duplicateDependencyReason(id uint64) string {
-	return fmt.Sprintf(
-		"依赖列表重复：直接上游作业 %d 在依赖列表中再次出现，同一作业不能重复引用，成功结果不可用",
-		id)
-}
-
-// firstIllegalOrderingDependency 按作业保存的依赖顺序找出第一个违反先后关系
-// 的直接上游作业号：正常提交只能引用已经存在的作业，而作业号按接受先后递增，
-// 因此直接上游作业号必须严格小于本作业号；引用自己（等于）或引用后来作业
-// （大于）都不合法。不比较提交时间，也不要求依赖列表按作业号排序——只判断
-// 每个作业号与本作业号的大小。没有违反时 ok=false。
-//
-// 与上游是否存在、是否成功无关：即使被引用的作业确实存在且已经成功，也不能
-// 接受这种依赖。运行期间提交时由 validateDependencyShapeLocked 与
-// validateDependenciesExistLocked（只能引用已存在作业，作业号又按接受先后递增）
-// 共同强制；本函数只服务于重新打开归档：已保存记录可能绕过提交
-// 校验（旧版本写入或记录被改动），恢复时必须按与提交一致的规则改判失败。
-// 这属于本作业记录自身有误，BlockerID 保持 0，不把被引用的有效作业判成失败。
-func firstIllegalOrderingDependency(j *storedJob) (id uint64, ok bool) {
-	for _, id := range j.dependencies {
-		if id >= j.id {
-			return id, true
-		}
-	}
-	return 0, false
-}
-
-// illegalOrderingDependencyReason 构造“依赖先后关系不合法”的失败原因：指出
-// 保存的依赖顺序中第一个不合法的上游作业号，并说明它不能作为本作业的上游。
-// BlockerID 保持 0——这是本作业记录自身有误，即使被引用的作业存在且成功也不
-// 把它判成失败或归因给它。
-func illegalOrderingDependencyReason(id, selfID uint64) string {
-	return fmt.Sprintf(
-		"依赖先后关系不合法：保存的依赖顺序中作业 %d 是第一个作业号不小于本作业 %d 的直接上游，作业号按接受先后递增，它不能作为本作业的上游，成功结果不可用",
-		id, selfID)
 }
 
 // emptyOriginalValuesReason 构造“原始整数序列为空”的失败原因：恢复出的排队记录

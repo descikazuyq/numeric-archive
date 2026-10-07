@@ -278,12 +278,13 @@ func syncDir(dir string) {
 //     排列的总和；上游不可用的同样改判为失败，其失败原因指出直接上游、
 //     BlockerID 沿链条保留最初的根因（与运行中依赖失败同一规则）；
 //     仅追加输入对不上而上游全部有效的属于本作业自身归档有误，BlockerID
-//     保持 0。排队记录的依赖列表重复引用同一作业号，或引用作业号不小于
-//     自己的作业（自己/后来作业），同样在恢复时直接判失败（BlockerID 为
-//     0），不再等待或开始计算；排队记录的原始整数序列为空（缺省、null 或
-//     空数组）也直接判失败（BlockerID 为 0）——提交时即拒绝空序列，恢复时
-//     不能凭已有实际输入或成功上游的总和补出原始参数后继续计算。仍在排队
-//     的其他作业在同一趟升序扫描中按既有依赖规则级联失败。
+//     保持 0。排队记录与成功记录共用 dependencyListFault 的同一项依赖列表
+//     合法性判断（先查重复、再查先后），依赖列表重复引用同一作业号，或引用
+//     作业号不小于自己的作业（自己/后来作业），同样在恢复时直接判失败
+//     （BlockerID 为 0），不再等待或开始计算；排队记录的原始整数序列为空
+//     （缺省、null 或空数组）也直接判失败（BlockerID 为 0）——提交时即拒绝
+//     空序列，恢复时不能凭已有实际输入或成功上游的总和补出原始参数后继续
+//     计算。仍在排队的其他作业在同一趟升序扫描中按既有依赖规则级联失败。
 func loadDir(dir string) ([]*storedJob, uint64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -386,7 +387,9 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 		}
 		if j.status == StatusSucceeded {
 			// 除完整性外，还必须满足三条独立的对应/复算规则：
-			//  0. 依赖列表自身合法，按以下顺序检查：
+			//  0. 依赖列表自身合法。这项判断不是成功记录专属：排队记录复查（第二趟
+			//     升序扫描）与这里共用 depvalidation.go 的 dependencyListFault，以后
+			//     调整规则只改那一处，两种状态不会漏掉一种。规则按固定顺序检查：
 			//     a. 同一直接上游作业号不能出现两次（相邻或隔着其他上游都算）。
 			//        这与提交时 validateDependencyShapeLocked 的唯一性要求一致；
 			//        旧版本或被改动的记录可能保存了重复引用，此时即使追加值、
@@ -412,10 +415,11 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 			// 直接上游恢复后的总和——需要全部记录恢复完毕才能核对，
 			// 在排序后的第二趟扫描中执行。
 			var invalidReason string
-			if dupID, dup := duplicateDependency(j); dup {
-				invalidReason = duplicateDependencyReason(dupID)
-			} else if badID, bad := firstIllegalOrderingDependency(j); bad {
-				invalidReason = illegalOrderingDependencyReason(badID, j.id)
+			// 依赖列表自身合法性（重复引用、引用自己或后来作业）的判断规则与排队
+			// 记录复查共用 dependencyListFault，先重复后先后；以下三项才是成功归档
+			// 独有的复核：
+			if reason, illegal := dependencyListFault(j); illegal {
+				invalidReason = reason
 			} else if !archiveIntact(j) {
 				invalidReason = "归档不完整或校验值不一致，成功结果不可用"
 			} else if !effectiveInputsCorrespond(j) {
@@ -448,10 +452,11 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	// BlockerID 才保持 0。
 	//   - 带依赖的成功记录：追加部分与上游恢复后的结果逐项核对；
 	//   - 排队记录：先检查记录自身是否合法——依赖列表重复引用同一作业号、
-	//     引用作业号不小于自己的作业（自己或后来作业），或原始整数序列为空，
-	//     都属本作业自身有误，BlockerID 为 0，立即失败（重复检查最前，空序列
-	//     检查最后）；再按保存的依赖顺序选取最靠前的不可用上游（已失败/取消，
-	//     或记录缺失），立即级联失败，不再等待。
+	//     引用作业号不小于自己的作业（自己或后来作业；两项的判断与原因与成功
+	//     记录第一趟复核共用 dependencyListFault，重复检查最前），或原始整数
+	//     序列为空，都属本作业自身有误，BlockerID 为 0，立即失败（空序列检查
+	//     在依赖合法性之后、最后）；再按保存的依赖顺序选取最靠前的不可用上游
+	//     （已失败/取消，或记录缺失），立即级联失败，不再等待。
 	//
 	// 依赖列表自身不合法属于记录自身问题，先于一切上游可用性判断：即使被引用
 	// 的上游仍在排队或确实存在且成功，不合法记录也要立即失败；而等待该记录
@@ -462,26 +467,19 @@ func loadDir(dir string) ([]*storedJob, uint64, error) {
 	}
 	for _, j := range jobs {
 		if j.status == StatusQueued {
-			// 排队记录自身有误的三项检查先于一切上游可用性判断，对有无依赖的
-			// 记录同样适用（无依赖时前两项自然不命中）：
-			//  1. 依赖列表重复引用同一作业号：不能开始计算，也不能把同一上游
-			//     总和追加两次后继续。BlockerID 保持 0，不把被重复引用且原本
-			//     有效的上游改成失败。
-			//  2. 依赖先后关系不合法：直接上游作业号必须严格小于本作业号，
-			//     引用自己或后来作业即使被引用者存在且成功也不能接受，不能开始
-			//     计算或继续等待。排在重复检查之后，已因重复依赖判失败的记录
-			//     保留现有说明。
-			//  3. 原始整数序列为空（缺省、null 或空数组）：提交时即拒绝空序列，
+			// 排队记录自身有误的检查先于一切上游可用性判断：
+			//  1. 依赖列表自身不合法（重复引用同一作业号、引用自己或后来作业）：
+			//     判断规则、检查顺序与失败原因与成功记录的第一趟归档复核完全共用
+			//     dependencyListFault——先查重复（不能开始计算，也不能把同一上游
+			//     总和追加两次），无重复时再查先后关系；两类问题同时存在时保留重复
+			//     依赖的失败原因。BlockerID 保持 0，被引用且原本有效的上游不被改判。
+			//  2. 原始整数序列为空（缺省、null 或空数组）：提交时即拒绝空序列，
 			//     恢复时遵守同一项输入要求——不能开始运行，也不能凭已有实际输入
 			//     或成功上游的总和补出原始参数。BlockerID 保持 0。空序列指没有
 			//     任何原始整数；[0]、[0,0] 等非空序列仍是合法输入，不按总和
 			//     是否为 0 判断。
-			if dupID, dup := duplicateDependency(j); dup {
-				failRestoredJob(dir, j, duplicateDependencyReason(dupID), 0)
-				continue
-			}
-			if badID, bad := firstIllegalOrderingDependency(j); bad {
-				failRestoredJob(dir, j, illegalOrderingDependencyReason(badID, j.id), 0)
+			if reason, illegal := dependencyListFault(j); illegal {
+				failRestoredJob(dir, j, reason, 0)
 				continue
 			}
 			if len(j.values) == 0 {
@@ -655,16 +653,16 @@ func duplicateRequestIDError(submitter, requestID string, firstID uint64, firstN
 }
 
 // failRestoredJob 收拢重新打开归档时把恢复出的作业改判为失败的统一处理，
-// 供六类恢复失败共用（调用顺序即各类判定的既有先后）：
+// 供五类恢复失败共用（调用顺序即各类判定的既有先后）：
 //   - 上次关闭时仍在运行的作业：计算被中断（第一趟记录扫描）；
 //   - 原标为成功、但归档完整性、依赖列表唯一性或先后关系、实际输入对应
 //     关系或数值结果不符规则的作业：本作业自身归档校验失败（第一趟记录
 //     扫描，BlockerID 恒 0；唯一性检查先于先后关系检查）；
-//   - 排队记录的依赖列表重复引用同一作业号：本作业记录自身有误（第二趟升序
-//     扫描，BlockerID 恒 0，先于上游可用性判断）；
-//   - 排队记录引用作业号不小于自己的作业（自己/后来作业）：本作业记录自身
-//     有误（第二趟升序扫描，BlockerID 恒 0，在重复检查之后、空序列检查与
-//     上游可用性判断之前）；
+//   - 排队记录的依赖列表自身不合法（重复引用同一作业号，或引用作业号不小于
+//     自己的作业，即自己/后来作业）：本作业记录自身有误（第二趟升序扫描，
+//     BlockerID 恒 0；判断规则与原因与上面的成功记录复核共用
+//     depvalidation.go 的 dependencyListFault，先重复后先后，再做空序列检查，
+//     全部先于上游可用性判断）；
 //   - 排队记录的原始整数序列为空（缺省、null 或空数组）：本作业记录自身
 //     有误（第二趟升序扫描，BlockerID 恒 0，在依赖列表自身合法性检查之后、
 //     上游可用性判断之前）；
