@@ -273,6 +273,13 @@ func syncDir(dir string) {
 //     先后关系规则），实际输入与原始参数或直接依赖数量不对应，或归档数值
 //     结果与有效输入按计算规则应得的结果不符时，fail-closed 地标记为失败，
 //     维持“成功必有完整归档”的不变量；
+//   - 依赖的两种写法（旧式 HasDependency/DependencyID 与有序 Dependencies）
+//     在记录与内嵌归档中遵守同一理解：Dependencies 非空时它就是实际的有序
+//     上游列表，旧字段的缺省、零值或残留（即使残留成另一个作业号）不能
+//     覆盖它、也不能单独让归档失效；两处表达的实际依赖必须逐项、按次序
+//     一致（不只比较集合），内容或次序不同仍按本作业自身归档有误改判失败。
+//     列表为空、缺省或为 null 时沿用旧方式：启用单依赖便使用该作业号，
+//     否则无依赖；旧式单依赖与只含同一作业号的列表表达同一内容；
 //   - 有依赖的成功记录还要求每个直接上游都存在、恢复后仍是带完整归档的
 //     成功状态，且实际输入的追加部分逐项等于这些上游按保存的依赖顺序
 //     排列的总和；上游不可用的同样改判为失败，其失败原因指出直接上游、
@@ -570,6 +577,16 @@ func parseJobRecord(dir, name string) (*storedJob, error) {
 		}
 		r.Archive.Submitter = aSub
 		r.Archive.RequestID = aReq
+		// 归档保存了非空有序依赖列表时，列表就是实际依赖；内嵌的旧单依赖
+		// 字段可能缺省、为零或残留另一个作业号，这里把它们统一改写为“有
+		// 依赖 + 列表首项”，使详情与内嵌归档对旧字段的理解保持一致
+		// （旧字段继续只表示是否有依赖以及列表首项），不改变列表与追加次序。
+		// 列表为空、缺省或为 null 时保留旧字段不动，沿用旧式单依赖含义。
+		if len(r.Archive.Dependencies) > 0 {
+			hasDep, depID := legacyDependencyFields(r.Archive.Dependencies)
+			r.Archive.HasDependency = hasDep
+			r.Archive.DependencyID = depID
+		}
 	}
 	switch r.Status {
 	case StatusQueued, StatusRunning, StatusSucceeded, StatusFailed, StatusCanceled:
@@ -690,17 +707,17 @@ func archiveIntact(j *storedJob) bool {
 	if a == nil {
 		return false
 	}
-	// 归档中的原始参数必须与记录顶层字段一致。
-	wantHasDependency, wantDependencyID := legacyDependencyFields(j.dependencies)
+	// 归档中的原始参数必须与记录顶层字段一致（依赖除外，见下方列表核对）。
 	if a.JobID != j.id || a.Submitter != j.submitter || a.RequestID != j.requestID ||
-		a.Seed != j.seed || a.HasDependency != wantHasDependency {
+		a.Seed != j.seed {
 		return false
 	}
-	if a.HasDependency && a.DependencyID != wantDependencyID {
-		return false
-	}
-	// 依赖列表（内容与次序）必须一致。旧格式归档没有 dependencies 字段，
-	// 由单依赖字段推导后再比较，与记录恢复、提交内容比较共用同一换算。
+	// 实际依赖只看两处规范化后的有序列表，逐项、按次序一致即可：归档中的
+	// HasDependency/DependencyID 缺省、为零或残留（例如指向列表第二项）不能
+	// 覆盖非空 Dependencies，也不能单独让归档失效；列表为空、缺省或为 null
+	// 时才沿用旧方式——启用了单依赖便使用该作业号，否则无依赖。这样同一内容
+	// 的单依赖归档与多依赖归档不会因旧字段写法不同被误判；但两处实际列表的
+	// 内容或次序不同仍在此识别，不放宽真实依赖检查。
 	aDeps := normalizeDependencies(a.HasDependency, a.DependencyID, a.Dependencies)
 	if len(aDeps) != len(j.dependencies) {
 		return false
